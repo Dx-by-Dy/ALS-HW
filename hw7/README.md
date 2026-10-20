@@ -28,8 +28,9 @@ cargo run -p server                         # http://127.0.0.1:3000
 
 ## MVVM в клиенте
 
-- **Model** — `client/src/model`: `Ticket`, `User`, `Tenant` с проверками
-  `validate_open` / `validate_close` / `validate_assign`, а также `TicketApiService` —
+- **Model** — `client/src/model`: данные — DTO из `api` (`TicketDto`, `UserDto`, `TenantDto`),
+  правила — трейт `TicketRules` с `validate_open` / `validate_close` / `validate_assign`
+  для `TicketDto`, а также `TicketApiService` —
   сервис, который отправляет команды на сервер через `HttpClient` (в браузере это `fetch`,
   в тестах — `MockHttpClient`).
 - **ViewModel** — `client/src/view_model.rs`: `TicketViewModel` хранит состояние в реактивных

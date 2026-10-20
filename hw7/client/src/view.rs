@@ -3,7 +3,9 @@
 
 use leptos::{prelude::*, task::spawn_local};
 
-use crate::model::{Ticket, TicketStatus, UserId, http::BrowserHttpClient};
+use api::{TicketDto, TicketStatus};
+
+use crate::model::http::BrowserHttpClient;
 use crate::view_model::TicketViewModel;
 
 type Vm = TicketViewModel<BrowserHttpClient>;
@@ -78,12 +80,12 @@ fn TicketList(vm: Vm) -> impl IntoView {
     }
 }
 
-fn ticket_row(vm: Vm, ticket: Ticket) -> impl IntoView {
+fn ticket_row(vm: Vm, ticket: TicketDto) -> impl IntoView {
     let id = ticket.ticket_id;
     let tenant = vm.tenant(ticket.tenant_id).map(|t| t.tenant_name);
     view! {
         <tr class:selected=move || vm.is_selected(id) on:click=move |_| vm.select_ticket(id)>
-            <td>{id.0}</td>
+            <td>{id}</td>
             <td>{tenant}</td>
             <td>{ticket.category}</td>
             <td>{ticket.description}</td>
@@ -122,7 +124,7 @@ fn TicketDetails(vm: Vm) -> impl IntoView {
                     <select
                         id="assignee"
                         on:change=move |ev| {
-                            vm.select_user(event_target_value(&ev).parse().ok().map(UserId))
+                            vm.select_user(event_target_value(&ev).parse().ok())
                         }
                     >
                         <option value="">"Choose a user"</option>
@@ -133,7 +135,7 @@ fn TicketDetails(vm: Vm) -> impl IntoView {
                                     let id = user.user_id;
                                     view! {
                                         <option
-                                            value=id.0.to_string()
+                                            value=id.to_string()
                                             selected=move || vm.selected_user_id() == Some(id)
                                         >
                                             {format!("{} ({})", user.user_name, user.role)}
@@ -157,12 +159,12 @@ fn TicketDetails(vm: Vm) -> impl IntoView {
     }
 }
 
-fn ticket_card(vm: Vm, ticket: Ticket) -> impl IntoView {
+fn ticket_card(vm: Vm, ticket: TicketDto) -> impl IntoView {
     let tenant = vm.tenant(ticket.tenant_id).map(|t| t.tenant_name);
     view! {
         <div class="card">
             <div class="card-title">
-                <h2>{format!("{} · {}", ticket.ticket_id, ticket.category)}</h2>
+                <h2>{format!("ticket-{} · {}", ticket.ticket_id, ticket.category)}</h2>
                 {status_badge(ticket.status)}
             </div>
             <p class="description">{ticket.description}</p>
@@ -185,7 +187,7 @@ fn status_badge(status: TicketStatus) -> impl IntoView {
     view! { <span class=class>{status.to_string()}</span> }
 }
 
-fn agent_name(vm: Vm, agent: Option<UserId>) -> String {
+fn agent_name(vm: Vm, agent: Option<usize>) -> String {
     agent
         .and_then(|id| vm.user_name(id))
         .unwrap_or_else(|| "—".to_owned())

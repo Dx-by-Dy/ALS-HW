@@ -7,7 +7,7 @@ use api::{AssignAgentRequest, ErrorDto, TenantDto, TicketDto, UserDto};
 use serde::de::DeserializeOwned;
 
 use super::http::{HttpClient, HttpRequest, TransportError};
-use super::{Tenant, TenantId, Ticket, User, ValidationError};
+use super::{TicketRules, ValidationError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiError {
@@ -53,56 +53,50 @@ impl<H: HttpClient> TicketApiService<H> {
         Self { http }
     }
 
-    pub async fn tickets(&self) -> Result<Vec<Ticket>, ApiError> {
-        let dtos: Vec<TicketDto> = self.request(HttpRequest::get(api::TICKETS)).await?;
-        Ok(dtos.into_iter().map(Ticket::from).collect())
+    pub async fn tickets(&self) -> Result<Vec<TicketDto>, ApiError> {
+        self.request(HttpRequest::get(api::TICKETS)).await
     }
 
-    pub async fn users(&self) -> Result<Vec<User>, ApiError> {
-        let dtos: Vec<UserDto> = self.request(HttpRequest::get(api::USERS)).await?;
-        Ok(dtos.into_iter().map(User::from).collect())
+    pub async fn users(&self) -> Result<Vec<UserDto>, ApiError> {
+        self.request(HttpRequest::get(api::USERS)).await
     }
 
-    pub async fn tenants(&self) -> Result<Vec<Tenant>, ApiError> {
-        let dtos: Vec<TenantDto> = self.request(HttpRequest::get(api::TENANTS)).await?;
-        Ok(dtos.into_iter().map(Tenant::from).collect())
+    pub async fn tenants(&self) -> Result<Vec<TenantDto>, ApiError> {
+        self.request(HttpRequest::get(api::TENANTS)).await
     }
 
     /// Открывает закрытый тикет и возвращает его состояние после команды.
-    pub async fn open_ticket(&self, ticket: &Ticket) -> Result<Ticket, ApiError> {
+    pub async fn open_ticket(&self, ticket: &TicketDto) -> Result<TicketDto, ApiError> {
         ticket.validate_open()?;
-        let path = api::open_ticket(ticket.ticket_id.0);
-        self.ticket_command(HttpRequest::post(path, None)).await
+        let path = api::open_ticket(ticket.ticket_id);
+        self.request(HttpRequest::post(path, None)).await
     }
 
     /// Закрывает открытый тикет и возвращает его состояние после команды.
-    pub async fn close_ticket(&self, ticket: &Ticket) -> Result<Ticket, ApiError> {
+    pub async fn close_ticket(&self, ticket: &TicketDto) -> Result<TicketDto, ApiError> {
         ticket.validate_close()?;
-        let path = api::close_ticket(ticket.ticket_id.0);
-        self.ticket_command(HttpRequest::post(path, None)).await
+        let path = api::close_ticket(ticket.ticket_id);
+        self.request(HttpRequest::post(path, None)).await
     }
 
-    pub async fn assign_agent(&self, ticket: &Ticket, agent: &User) -> Result<Ticket, ApiError> {
+    pub async fn assign_agent(
+        &self,
+        ticket: &TicketDto,
+        agent: &UserDto,
+    ) -> Result<TicketDto, ApiError> {
         ticket.validate_assign(agent)?;
         let body = AssignAgentRequest {
-            agent_id: agent.user_id.0,
+            agent_id: agent.user_id,
         };
         let body = serde_json::to_string(&body).expect("request serializes to JSON");
-        let path = api::assign_agent(ticket.ticket_id.0);
-        self.ticket_command(HttpRequest::post(path, Some(body)))
-            .await
+        let path = api::assign_agent(ticket.ticket_id);
+        self.request(HttpRequest::post(path, Some(body))).await
     }
 
     /// Пересчитывает скидку тенанта по числу его открытых тикетов.
-    pub async fn apply_discount(&self, tenant_id: TenantId) -> Result<Tenant, ApiError> {
-        let path = api::apply_discount(tenant_id.0);
-        let dto: TenantDto = self.request(HttpRequest::post(path, None)).await?;
-        Ok(dto.into())
-    }
-
-    async fn ticket_command(&self, request: HttpRequest) -> Result<Ticket, ApiError> {
-        let dto: TicketDto = self.request(request).await?;
-        Ok(dto.into())
+    pub async fn apply_discount(&self, tenant_id: usize) -> Result<TenantDto, ApiError> {
+        let path = api::apply_discount(tenant_id);
+        self.request(HttpRequest::post(path, None)).await
     }
 
     async fn request<T: DeserializeOwned>(&self, request: HttpRequest) -> Result<T, ApiError> {
@@ -127,7 +121,7 @@ mod tests {
     use crate::model::fixtures::{ticket, user};
     use crate::model::http::Method;
     use crate::model::mock_http::MockHttpClient;
-    use crate::model::{Role, TicketId, TicketStatus, UserId};
+    use api::{Role, TicketStatus};
 
     fn service() -> (TicketApiService<MockHttpClient>, MockHttpClient) {
         let http = MockHttpClient::default();
@@ -206,15 +200,11 @@ mod tests {
         let (service, http) = service();
         assert_eq!(
             block_on(service.close_ticket(&ticket(2, TicketStatus::Closed))),
-            Err(ApiError::Validation(ValidationError::AlreadyClosed(
-                TicketId(2)
-            )))
+            Err(ApiError::Validation(ValidationError::AlreadyClosed(2)))
         );
         assert_eq!(
             block_on(service.open_ticket(&ticket(2, TicketStatus::Open))),
-            Err(ApiError::Validation(ValidationError::AlreadyOpen(
-                TicketId(2)
-            )))
+            Err(ApiError::Validation(ValidationError::AlreadyOpen(2)))
         );
         assert!(http.requests().is_empty());
     }
@@ -263,7 +253,7 @@ mod tests {
         let assigned = block_on(service.assign_agent(&ticket(2, TicketStatus::Open), &alice));
 
         let assigned = assigned.unwrap();
-        assert_eq!(assigned.assigned_agent, Some(UserId(5)));
+        assert_eq!(assigned.assigned_agent, Some(5));
         assert_eq!(assigned.status, TicketStatus::InProgress);
         let request = &http.requests()[0];
         assert_eq!(request.method, Method::Post);
@@ -293,7 +283,7 @@ mod tests {
         };
         http.respond_json(200, &tenant);
 
-        let tenant = block_on(service.apply_discount(TenantId(1))).unwrap();
+        let tenant = block_on(service.apply_discount(1)).unwrap();
 
         assert_eq!(tenant.discount_percent, 10);
         assert_eq!(

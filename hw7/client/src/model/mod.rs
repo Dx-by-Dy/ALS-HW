@@ -1,6 +1,7 @@
 //! Model: данные приложения, правила допустимости команд и сервис связи с бэкендом.
 //!
-//! Источник истины — сервер. Клиентская модель проверяет команды заранее, чтобы не слать
+//! Данные — DTO из общего crate `api`, отдельной копии структур на клиенте нет.
+//! Источник истины — сервер: клиент проверяет команды заранее, чтобы не слать
 //! заведомо отклонённые запросы, а состояние после команды берёт из ответа сервера.
 
 pub mod http;
@@ -11,38 +12,21 @@ pub mod ticket_api;
 use std::error::Error;
 use std::fmt;
 
-use api::{TenantDto, TicketDto, UserDto};
+use api::{Role, TicketDto, TicketStatus, UserDto};
 
-pub use api::{Role, TicketStatus};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TicketId(pub usize);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct UserId(pub usize);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TenantId(pub usize);
-
-impl fmt::Display for TicketId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ticket-{}", self.0)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Ticket {
-    pub ticket_id: TicketId,
-    pub category: String,
-    pub description: String,
-    pub status: TicketStatus,
-    pub assigned_agent: Option<UserId>,
-    pub tenant_id: TenantId,
-}
-
-impl Ticket {
+/// Правила допустимости команд над тикетом. Данные модели — DTO из `api`, а правила
+/// клиент добавляет к ним сам: по ним ViewModel решает, доступна ли команда.
+pub trait TicketRules {
     /// Открыть можно только закрытый тикет.
-    pub fn validate_open(&self) -> Result<(), ValidationError> {
+    fn validate_open(&self) -> Result<(), ValidationError>;
+    /// Закрыть можно только открытый тикет.
+    fn validate_close(&self) -> Result<(), ValidationError>;
+    /// Назначить можно только агента, только на открытый тикет и только другого агента.
+    fn validate_assign(&self, agent: &UserDto) -> Result<(), ValidationError>;
+}
+
+impl TicketRules for TicketDto {
+    fn validate_open(&self) -> Result<(), ValidationError> {
         match self.status {
             TicketStatus::Closed => Ok(()),
             TicketStatus::Open | TicketStatus::InProgress => {
@@ -51,16 +35,14 @@ impl Ticket {
         }
     }
 
-    /// Закрыть можно только открытый тикет.
-    pub fn validate_close(&self) -> Result<(), ValidationError> {
+    fn validate_close(&self) -> Result<(), ValidationError> {
         match self.status {
             TicketStatus::Closed => Err(ValidationError::AlreadyClosed(self.ticket_id)),
             TicketStatus::Open | TicketStatus::InProgress => Ok(()),
         }
     }
 
-    /// Назначить можно только агента, только на открытый тикет и только другого агента.
-    pub fn validate_assign(&self, agent: &User) -> Result<(), ValidationError> {
+    fn validate_assign(&self, agent: &UserDto) -> Result<(), ValidationError> {
         self.validate_close()?;
         if agent.role != Role::Agent {
             return Err(ValidationError::NotAnAgent {
@@ -78,75 +60,20 @@ impl Ticket {
     }
 }
 
-impl From<TicketDto> for Ticket {
-    fn from(dto: TicketDto) -> Self {
-        Self {
-            ticket_id: TicketId(dto.ticket_id),
-            category: dto.category,
-            description: dto.description,
-            status: dto.status,
-            assigned_agent: dto.assigned_agent.map(UserId),
-            tenant_id: TenantId(dto.tenant_id),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct User {
-    pub user_id: UserId,
-    pub user_name: String,
-    pub role: Role,
-}
-
-impl From<UserDto> for User {
-    fn from(dto: UserDto) -> Self {
-        Self {
-            user_id: UserId(dto.user_id),
-            user_name: dto.user_name,
-            role: dto.role,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Tenant {
-    pub tenant_id: TenantId,
-    pub tenant_name: String,
-    pub discount_percent: u8,
-    pub open_tickets: usize,
-}
-
-impl From<TenantDto> for Tenant {
-    fn from(dto: TenantDto) -> Self {
-        Self {
-            tenant_id: TenantId(dto.tenant_id),
-            tenant_name: dto.tenant_name,
-            discount_percent: dto.discount_percent,
-            open_tickets: dto.open_tickets,
-        }
-    }
-}
-
 /// Команда недопустима при текущем состоянии модели.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
-    AlreadyOpen(TicketId),
-    AlreadyClosed(TicketId),
-    NotAnAgent {
-        user_name: String,
-        role: Role,
-    },
-    AlreadyAssigned {
-        user_name: String,
-        ticket_id: TicketId,
-    },
+    AlreadyOpen(usize),
+    AlreadyClosed(usize),
+    NotAnAgent { user_name: String, role: Role },
+    AlreadyAssigned { user_name: String, ticket_id: usize },
 }
 
 impl fmt::Display for ValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::AlreadyOpen(id) => write!(f, "{id} is already open"),
-            Self::AlreadyClosed(id) => write!(f, "{id} is already closed"),
+            Self::AlreadyOpen(id) => write!(f, "ticket-{id} is already open"),
+            Self::AlreadyClosed(id) => write!(f, "ticket-{id} is already closed"),
             Self::NotAnAgent { user_name, role } => {
                 write!(
                     f,
@@ -156,7 +83,7 @@ impl fmt::Display for ValidationError {
             Self::AlreadyAssigned {
                 user_name,
                 ticket_id,
-            } => write!(f, "{user_name} is already assigned to {ticket_id}"),
+            } => write!(f, "{user_name} is already assigned to ticket-{ticket_id}"),
         }
     }
 }
@@ -167,20 +94,20 @@ impl Error for ValidationError {}
 pub mod fixtures {
     use super::*;
 
-    pub fn ticket(id: usize, status: TicketStatus) -> Ticket {
-        Ticket {
-            ticket_id: TicketId(id),
+    pub fn ticket(id: usize, status: TicketStatus) -> TicketDto {
+        TicketDto {
+            ticket_id: id,
             category: "Technical Issue".to_owned(),
             description: "VPN is down".to_owned(),
             status,
             assigned_agent: None,
-            tenant_id: TenantId(1),
+            tenant_id: 1,
         }
     }
 
-    pub fn user(id: usize, name: &str, role: Role) -> User {
-        User {
-            user_id: UserId(id),
+    pub fn user(id: usize, name: &str, role: Role) -> UserDto {
+        UserDto {
+            user_id: id,
             user_name: name.to_owned(),
             role,
         }
@@ -198,7 +125,7 @@ mod tests {
         for status in [TicketStatus::Open, TicketStatus::InProgress] {
             assert_eq!(
                 ticket(1, status).validate_open(),
-                Err(ValidationError::AlreadyOpen(TicketId(1)))
+                Err(ValidationError::AlreadyOpen(1))
             );
         }
     }
@@ -210,7 +137,7 @@ mod tests {
         }
         assert_eq!(
             ticket(1, TicketStatus::Closed).validate_close(),
-            Err(ValidationError::AlreadyClosed(TicketId(1)))
+            Err(ValidationError::AlreadyClosed(1))
         );
     }
 
@@ -234,17 +161,17 @@ mod tests {
         let alice = user(1, "Alice", Role::Agent);
         assert_eq!(
             ticket(1, TicketStatus::Closed).validate_assign(&alice),
-            Err(ValidationError::AlreadyClosed(TicketId(1)))
+            Err(ValidationError::AlreadyClosed(1))
         );
-        let assigned = Ticket {
-            assigned_agent: Some(UserId(1)),
+        let assigned = TicketDto {
+            assigned_agent: Some(1),
             ..ticket(1, TicketStatus::InProgress)
         };
         assert_eq!(
             assigned.validate_assign(&alice),
             Err(ValidationError::AlreadyAssigned {
                 user_name: "Alice".to_owned(),
-                ticket_id: TicketId(1)
+                ticket_id: 1
             })
         );
     }

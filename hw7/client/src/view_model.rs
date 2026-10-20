@@ -6,19 +6,20 @@
 
 use std::sync::Arc;
 
+use api::{TenantDto, TicketDto, UserDto};
 use leptos::prelude::*;
 
+use crate::model::TicketRules;
 use crate::model::http::HttpClient;
 use crate::model::ticket_api::{ApiError, TicketApiService};
-use crate::model::{Tenant, TenantId, Ticket, TicketId, User, UserId};
 
 pub struct TicketViewModel<H: 'static> {
     api: StoredValue<Arc<TicketApiService<H>>>,
-    tickets: RwSignal<Vec<Ticket>>,
-    users: RwSignal<Vec<User>>,
-    tenants: RwSignal<Vec<Tenant>>,
-    selected_ticket: RwSignal<Option<TicketId>>,
-    selected_user: RwSignal<Option<UserId>>,
+    tickets: RwSignal<Vec<TicketDto>>,
+    users: RwSignal<Vec<UserDto>>,
+    tenants: RwSignal<Vec<TenantDto>>,
+    selected_ticket: RwSignal<Option<usize>>,
+    selected_user: RwSignal<Option<usize>>,
     busy: RwSignal<bool>,
     error: RwSignal<Option<String>>,
 }
@@ -49,29 +50,29 @@ impl<H: HttpClient + Send + Sync + 'static> TicketViewModel<H> {
 
     // --- Свойства для привязки ---
 
-    pub fn tickets(&self) -> Vec<Ticket> {
+    pub fn tickets(&self) -> Vec<TicketDto> {
         self.tickets.get()
     }
 
-    pub fn users(&self) -> Vec<User> {
+    pub fn users(&self) -> Vec<UserDto> {
         self.users.get()
     }
 
-    pub fn tenants(&self) -> Vec<Tenant> {
+    pub fn tenants(&self) -> Vec<TenantDto> {
         self.tenants.get()
     }
 
-    pub fn selected(&self) -> Option<Ticket> {
+    pub fn selected(&self) -> Option<TicketDto> {
         let id = self.selected_ticket.get()?;
         self.tickets
             .with(|tickets| tickets.iter().find(|t| t.ticket_id == id).cloned())
     }
 
-    pub fn is_selected(&self, ticket_id: TicketId) -> bool {
+    pub fn is_selected(&self, ticket_id: usize) -> bool {
         self.selected_ticket.get() == Some(ticket_id)
     }
 
-    pub fn selected_user_id(&self) -> Option<UserId> {
+    pub fn selected_user_id(&self) -> Option<usize> {
         self.selected_user.get()
     }
 
@@ -83,7 +84,7 @@ impl<H: HttpClient + Send + Sync + 'static> TicketViewModel<H> {
         self.error.get()
     }
 
-    pub fn user_name(&self, user_id: UserId) -> Option<String> {
+    pub fn user_name(&self, user_id: usize) -> Option<String> {
         self.users.with(|users| {
             users
                 .iter()
@@ -92,17 +93,17 @@ impl<H: HttpClient + Send + Sync + 'static> TicketViewModel<H> {
         })
     }
 
-    pub fn tenant(&self, tenant_id: TenantId) -> Option<Tenant> {
+    pub fn tenant(&self, tenant_id: usize) -> Option<TenantDto> {
         self.tenants
             .with(|tenants| tenants.iter().find(|t| t.tenant_id == tenant_id).cloned())
     }
 
-    pub fn select_ticket(&self, ticket_id: TicketId) {
+    pub fn select_ticket(&self, ticket_id: usize) {
         self.selected_ticket.set(Some(ticket_id));
         self.error.set(None);
     }
 
-    pub fn select_user(&self, user_id: Option<UserId>) {
+    pub fn select_user(&self, user_id: Option<usize>) {
         self.selected_user.set(user_id);
     }
 
@@ -125,7 +126,7 @@ impl<H: HttpClient + Send + Sync + 'static> TicketViewModel<H> {
         self.assignment()?.err()
     }
 
-    fn assignment(&self) -> Option<Result<(Ticket, User), String>> {
+    fn assignment(&self) -> Option<Result<(TicketDto, UserDto), String>> {
         let ticket = self.selected()?;
         let user_id = self.selected_user.get()?;
         let user = self
@@ -206,7 +207,7 @@ impl<H: HttpClient + Send + Sync + 'static> TicketViewModel<H> {
     async fn sync_after_status_change(
         &self,
         api: &TicketApiService<H>,
-        ticket: Ticket,
+        ticket: TicketDto,
     ) -> Result<(), ApiError> {
         let tenant_id = ticket.tenant_id;
         self.replace_ticket(ticket);
@@ -219,7 +220,7 @@ impl<H: HttpClient + Send + Sync + 'static> TicketViewModel<H> {
         Ok(())
     }
 
-    fn replace_ticket(&self, ticket: Ticket) {
+    fn replace_ticket(&self, ticket: TicketDto) {
         self.tickets.update(|tickets| {
             if let Some(t) = tickets.iter_mut().find(|t| t.ticket_id == ticket.ticket_id) {
                 *t = ticket;
@@ -239,13 +240,12 @@ impl<H: HttpClient + Send + Sync + 'static> TicketViewModel<H> {
 
 #[cfg(test)]
 mod tests {
-    use api::{TenantDto, TicketDto, UserDto};
     use futures::executor::block_on;
 
     use super::*;
     use crate::model::http::HttpRequest;
     use crate::model::mock_http::MockHttpClient;
-    use crate::model::{Role, TicketStatus};
+    use api::{Role, TicketStatus};
 
     fn ticket_dto(id: usize, status: TicketStatus) -> TicketDto {
         TicketDto {
@@ -300,11 +300,7 @@ mod tests {
 
     fn status(vm: &TicketViewModel<MockHttpClient>, id: usize) -> TicketStatus {
         let tickets = vm.tickets();
-        tickets
-            .iter()
-            .find(|t| t.ticket_id == TicketId(id))
-            .unwrap()
-            .status
+        tickets.iter().find(|t| t.ticket_id == id).unwrap().status
     }
 
     #[test]
@@ -312,8 +308,8 @@ mod tests {
         let (vm, http) = loaded();
         assert_eq!(vm.tickets().len(), 2);
         assert_eq!(vm.users().len(), 2);
-        assert_eq!(vm.tenant(TenantId(1)).unwrap().discount_percent, 10);
-        assert_eq!(vm.selected().unwrap().ticket_id, TicketId(1));
+        assert_eq!(vm.tenant(1).unwrap().discount_percent, 10);
+        assert_eq!(vm.selected().unwrap().ticket_id, 1);
         assert_eq!(http.requests().len(), 3);
         assert!(!vm.is_busy());
         assert_eq!(vm.error(), None);
@@ -325,7 +321,7 @@ mod tests {
         assert!(vm.can_close());
         assert!(!vm.can_open());
 
-        vm.select_ticket(TicketId(2));
+        vm.select_ticket(2);
         assert!(!vm.can_close());
         assert!(vm.can_open());
     }
@@ -336,7 +332,7 @@ mod tests {
         assert!(!vm.can_open() && !vm.can_close() && !vm.can_assign());
 
         let (vm, _) = loaded();
-        vm.select_user(Some(UserId(1)));
+        vm.select_user(Some(1));
         vm.busy.set(true);
         assert!(!vm.can_open() && !vm.can_close() && !vm.can_assign());
     }
@@ -347,14 +343,14 @@ mod tests {
         assert!(!vm.can_assign());
         assert_eq!(vm.assign_hint(), None);
 
-        vm.select_user(Some(UserId(2)));
+        vm.select_user(Some(2));
         assert!(!vm.can_assign());
         assert_eq!(
             vm.assign_hint().as_deref(),
             Some("Bob has role Customer, only agents can be assigned")
         );
 
-        vm.select_user(Some(UserId(1)));
+        vm.select_user(Some(1));
         assert!(vm.can_assign());
         assert_eq!(vm.assign_hint(), None);
     }
@@ -368,7 +364,7 @@ mod tests {
         block_on(vm.close_ticket());
 
         assert_eq!(status(&vm, 1), TicketStatus::Closed);
-        assert_eq!(vm.tenant(TenantId(1)).unwrap().discount_percent, 0);
+        assert_eq!(vm.tenant(1).unwrap().discount_percent, 0);
         assert_eq!(
             http.requests()[3..],
             [
@@ -383,14 +379,14 @@ mod tests {
     #[test]
     fn open_syncs_ticket() {
         let (vm, http) = loaded();
-        vm.select_ticket(TicketId(2));
+        vm.select_ticket(2);
         http.respond_json(200, &ticket_dto(2, TicketStatus::Open))
             .respond_json(200, &tenant_dto(7, 10));
 
         block_on(vm.open_ticket());
 
         assert_eq!(status(&vm, 2), TicketStatus::Open);
-        assert_eq!(vm.tenant(TenantId(1)).unwrap().open_tickets, 7);
+        assert_eq!(vm.tenant(1).unwrap().open_tickets, 7);
     }
 
     #[test]
@@ -413,7 +409,7 @@ mod tests {
     fn unavailable_command_sends_nothing() {
         let (vm, http) = loaded();
         block_on(vm.open_ticket());
-        vm.select_user(Some(UserId(2)));
+        vm.select_user(Some(2));
         block_on(vm.assign_agent());
         assert_eq!(http.requests().len(), 3);
     }
@@ -421,7 +417,7 @@ mod tests {
     #[test]
     fn assign_updates_ticket() {
         let (vm, http) = loaded();
-        vm.select_user(Some(UserId(1)));
+        vm.select_user(Some(1));
         http.respond_json(
             200,
             &TicketDto {
@@ -434,7 +430,7 @@ mod tests {
 
         let ticket = vm.selected().unwrap();
         assert_eq!(ticket.status, TicketStatus::InProgress);
-        assert_eq!(ticket.assigned_agent, Some(UserId(1)));
+        assert_eq!(ticket.assigned_agent, Some(1));
         assert!(!vm.can_assign());
     }
 }
