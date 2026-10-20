@@ -41,6 +41,15 @@ impl OpenTickets {
             TicketEvent::Closed(e) => {
                 self.tickets.remove(&e.ticket_id);
             }
+            TicketEvent::Reopened(e) => {
+                self.tickets.insert(
+                    e.ticket_id,
+                    OpenTicket {
+                        tenant_id: e.tenant_id,
+                        last_activity: e.at,
+                    },
+                );
+            }
         }
     }
 
@@ -70,7 +79,7 @@ mod tests {
     use crate::domain::{
         ticket::{
             AgentAssignedEvent, CloseReason, INACTIVITY_TIMEOUT_SECS, TicketClosedEvent,
-            TicketCreatedEvent,
+            TicketCreatedEvent, TicketReopenedEvent,
         },
         user::UserId,
     };
@@ -127,6 +136,27 @@ mod tests {
         assert_eq!(
             view.inactive_at(Timestamp(INACTIVITY_TIMEOUT_SECS + 100)),
             [TicketId(1), TicketId(2)]
+        );
+    }
+
+    #[test]
+    fn reopened_ticket_counts_again_with_fresh_activity() {
+        let mut view = OpenTickets::default();
+        view.project(&created(1, 1, 0));
+        view.project(&closed(1));
+        view.project(&TicketEvent::Reopened(TicketReopenedEvent {
+            ticket_id: TicketId(1),
+            tenant_id: TenantId(1),
+            at: Timestamp(100),
+        }));
+        assert_eq!(view.count_for_tenant(TenantId(1)), 1);
+        assert!(
+            view.inactive_at(Timestamp(INACTIVITY_TIMEOUT_SECS))
+                .is_empty()
+        );
+        assert_eq!(
+            view.inactive_at(Timestamp(INACTIVITY_TIMEOUT_SECS + 100)),
+            [TicketId(1)]
         );
     }
 

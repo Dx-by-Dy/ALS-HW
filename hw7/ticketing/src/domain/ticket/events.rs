@@ -8,6 +8,7 @@ pub enum TicketEvent {
     Created(TicketCreatedEvent),
     AgentAssigned(AgentAssignedEvent),
     Closed(TicketClosedEvent),
+    Reopened(TicketReopenedEvent),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,12 +36,21 @@ pub struct TicketClosedEvent {
     pub at: Timestamp,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketReopenedEvent {
+    pub ticket_id: TicketId,
+    /// Нужен проекции открытых тикетов: событие закрытия убирает тикет из неё целиком.
+    pub tenant_id: TenantId,
+    pub at: Timestamp,
+}
+
 impl TicketEvent {
     pub fn ticket_id(&self) -> TicketId {
         match self {
             Self::Created(e) => e.ticket_id,
             Self::AgentAssigned(e) => e.ticket_id,
             Self::Closed(e) => e.ticket_id,
+            Self::Reopened(e) => e.ticket_id,
         }
     }
 }
@@ -67,6 +77,7 @@ impl fmt::Display for TicketEvent {
                     e.ticket_id, e.reason, e.at
                 )
             }
+            Self::Reopened(e) => write!(f, "TicketReopened: {} at {}", e.ticket_id, e.at),
         }
     }
 }

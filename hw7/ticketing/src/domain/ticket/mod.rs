@@ -7,7 +7,9 @@ use std::fmt;
 
 pub use command::{CloseReason, TicketCommand};
 pub use error::TicketError;
-pub use events::{AgentAssignedEvent, TicketClosedEvent, TicketCreatedEvent, TicketEvent};
+pub use events::{
+    AgentAssignedEvent, TicketClosedEvent, TicketCreatedEvent, TicketEvent, TicketReopenedEvent,
+};
 pub use status::TicketStatus;
 
 use crate::core::{
@@ -112,6 +114,19 @@ impl Ticket {
         }))
     }
 
+    /// Решение об открытии закрытого тикета. Он начинает жизнь заново: без агента
+    /// и с новым отсчётом неактивности.
+    pub fn reopen(&self, at: Timestamp) -> Result<TicketEvent, TicketError> {
+        if self.status.is_open() {
+            return Err(TicketError::AlreadyOpen(self.ticket_id));
+        }
+        Ok(TicketEvent::Reopened(TicketReopenedEvent {
+            ticket_id: self.ticket_id,
+            tenant_id: self.tenant,
+            at,
+        }))
+    }
+
     pub fn ticket_id(&self) -> TicketId {
         self.ticket_id
     }
@@ -163,6 +178,12 @@ impl Ticket {
                 status: TicketStatus::Closed,
                 ..self
             },
+            TicketEvent::Reopened(e) => Self {
+                status: TicketStatus::Open,
+                assigned_agent: None,
+                last_activity: e.at,
+                ..self
+            },
         }
     }
 }
@@ -210,6 +231,7 @@ impl CommandHandler for Option<Ticket> {
                 ticket.assign_agent(agent, *at)
             }
             (Some(ticket), TicketCommand::Close { reason, at }) => ticket.close(*reason, *at),
+            (Some(ticket), TicketCommand::Reopen { at }) => ticket.reopen(*at),
         }
     }
 }
@@ -260,6 +282,16 @@ mod tests {
 
     fn open_ticket() -> Option<Ticket> {
         execute(None, create_command())
+    }
+
+    fn closed_ticket() -> Option<Ticket> {
+        execute(
+            open_ticket(),
+            TicketCommand::Close {
+                reason: CloseReason::Resolved,
+                at: T0,
+            },
+        )
     }
 
     fn assigned_ticket(agent: &User, at: Timestamp) -> Option<Ticket> {
@@ -331,8 +363,10 @@ mod tests {
             reason: CloseReason::Resolved,
             at: T0,
         };
+        let reopen = TicketCommand::Reopen { at: T0 };
         assert_eq!(None::<Ticket>.decide(&assign), Err(TicketError::NotFound));
         assert_eq!(None::<Ticket>.decide(&close), Err(TicketError::NotFound));
+        assert_eq!(None::<Ticket>.decide(&reopen), Err(TicketError::NotFound));
     }
 
     #[test]
@@ -403,6 +437,75 @@ mod tests {
         };
         assert_eq!(event.previous_agent_id, Some(UserId(2)));
         assert_eq!(event.agent_id, UserId(3));
+    }
+
+    #[test]
+    fn close_moves_open_ticket_to_closed() {
+        assert_eq!(open_ticket().unwrap().status(), TicketStatus::Open);
+        assert_eq!(closed_ticket().unwrap().status(), TicketStatus::Closed);
+    }
+
+    #[test]
+    fn closing_closed_ticket_is_rejected() {
+        let close = TicketCommand::Close {
+            reason: CloseReason::Resolved,
+            at: T0,
+        };
+        assert_eq!(
+            closed_ticket().decide(&close),
+            Err(TicketError::Closed(TicketId(1)))
+        );
+    }
+
+    #[test]
+    fn reopen_moves_closed_ticket_to_open() {
+        let at = Timestamp(T0.0 + 60);
+        assert_eq!(
+            closed_ticket().decide(&TicketCommand::Reopen { at }),
+            Ok(TicketEvent::Reopened(TicketReopenedEvent {
+                ticket_id: TicketId(1),
+                tenant_id: TenantId(1),
+                at,
+            }))
+        );
+        let ticket = execute(closed_ticket(), TicketCommand::Reopen { at }).unwrap();
+        assert_eq!(ticket.status(), TicketStatus::Open);
+        assert_eq!(ticket.last_activity(), at);
+    }
+
+    #[test]
+    fn reopened_ticket_starts_without_agent() {
+        let close = TicketCommand::Close {
+            reason: CloseReason::Resolved,
+            at: T0,
+        };
+        let closed = execute(assigned_ticket(&user(2, Role::Agent), T0), close);
+        let ticket = execute(closed, TicketCommand::Reopen { at: T0 }).unwrap();
+        assert_eq!(ticket.status(), TicketStatus::Open);
+        assert_eq!(ticket.assigned_agent(), None);
+    }
+
+    #[test]
+    fn reopening_open_ticket_is_rejected() {
+        let reopen = TicketCommand::Reopen { at: T0 };
+        let in_progress = assigned_ticket(&user(2, Role::Agent), T0);
+        for ticket in [open_ticket(), in_progress] {
+            assert_eq!(
+                ticket.decide(&reopen),
+                Err(TicketError::AlreadyOpen(TicketId(1)))
+            );
+        }
+    }
+
+    #[test]
+    fn reopened_ticket_can_be_closed_again() {
+        let reopened = execute(closed_ticket(), TicketCommand::Reopen { at: T0 });
+        let close = TicketCommand::Close {
+            reason: CloseReason::Resolved,
+            at: T0,
+        };
+        let ticket = execute(reopened, close).unwrap();
+        assert_eq!(ticket.status(), TicketStatus::Closed);
     }
 
     #[test]

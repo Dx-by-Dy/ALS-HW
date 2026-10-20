@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Support tickets</title>
+    <link data-trunk rel="rust" data-bin="client" />
+    <style>
+      :root {
+        --bg: #f5f6f8;
+        --panel: #ffffff;
+        --text: #1d2330;
+        --muted: #6b7280;
+        --border: #e2e5ea;
+        --accent: #2f6fde;
+        --accent-text: #ffffff;
+        --danger: #c8372d;
+        --selected: #e8f0fd;
+        --open: #1f7a4d;
+        --open-bg: #e3f4ea;
+        --progress: #8a5a00;
+        --progress-bg: #fbf0d9;
+        --closed: #5b6170;
+        --closed-bg: #eceef2;
+        --error: #b42318;
+        --error-bg: #fdecea;
+        color-scheme: light;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #14171d;
+          --panel: #1c2028;
+          --text: #e6e8ec;
+          --muted: #9aa1ad;
+          --border: #2e3440;
+          --accent: #5b8ff0;
+          --accent-text: #0e1420;
+          --danger: #ef6b61;
+          --selected: #22304a;
+          --open: #6fd39e;
+          --open-bg: #1d3328;
+          --progress: #f2c46b;
+          --progress-bg: #382e19;
+          --closed: #b3b9c4;
+          --closed-bg: #2a2f38;
+          --error: #ff8a80;
+          --error-bg: #3a1f1d;
+          color-scheme: dark;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      .app { max-width: 1180px; margin: 0 auto; padding: 24px 16px; }
+      .topbar { display: flex; align-items: baseline; gap: 16px; }
+      h1 { font-size: 22px; margin: 0 0 16px; }
+      h2 { font-size: 17px; margin: 0; }
+      .sync { color: var(--muted); font-size: 13px; visibility: hidden; }
+      .sync.visible { visibility: visible; }
+      .tenants { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
+      .tenant {
+        display: flex; gap: 12px; align-items: baseline;
+        background: var(--panel); border: 1px solid var(--border);
+        border-radius: 8px; padding: 8px 14px; color: var(--muted);
+      }
+      .tenant-name { color: var(--text); font-weight: 600; }
+      .tenant.discounted .discount { color: var(--open); font-weight: 600; }
+      .layout { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; align-items: start; }
+      @media (max-width: 860px) { .layout { grid-template-columns: minmax(0, 1fr); } }
+      .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; }
+      .list { overflow-x: auto; }
+      table { width: 100%; border-collapse: collapse; }
+      th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--border); }
+      th { color: var(--muted); font-weight: 500; font-size: 13px; }
+      tbody tr { cursor: pointer; }
+      tbody tr:hover { background: var(--bg); }
+      tbody tr.selected { background: var(--selected); }
+      tbody tr:last-child td { border-bottom: none; }
+      .badge { display: inline-block; padding: 1px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+      .badge.open { color: var(--open); background: var(--open-bg); }
+      .badge.in-progress { color: var(--progress); background: var(--progress-bg); }
+      .badge.closed { color: var(--closed); background: var(--closed-bg); }
+      .details { padding: 16px; display: flex; flex-direction: column; gap: 16px; }
+      .card-title { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+      .description { margin: 8px 0; }
+      dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0; }
+      dt { color: var(--muted); }
+      dd { margin: 0; }
+      .empty { color: var(--muted); margin: 0; }
+      .actions, .assign-row { display: flex; gap: 8px; }
+      .assign { display: flex; flex-direction: column; gap: 6px; }
+      label { font-size: 13px; color: var(--muted); }
+      select, button { font: inherit; border-radius: 6px; padding: 7px 12px; }
+      select { flex: 1; min-width: 0; background: var(--panel); color: var(--text); border: 1px solid var(--border); }
+      button { border: 1px solid var(--accent); background: var(--accent); color: var(--accent-text); cursor: pointer; }
+      button.danger { border-color: var(--danger); background: transparent; color: var(--danger); }
+      button:disabled { opacity: 0.4; cursor: not-allowed; }
+      .hint { margin: 0; min-height: 1.2em; font-size: 13px; color: var(--muted); }
+      .error:empty { display: none; }
+      .error { margin: 0; padding: 8px 12px; border-radius: 6px; color: var(--error); background: var(--error-bg); }
+    </style>
+  </head>
+  <body></body>
+</html>

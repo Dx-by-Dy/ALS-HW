@@ -24,6 +24,10 @@ pub enum TicketCommand {
         reason: CloseReason,
         at: Timestamp,
     },
+    /// Снова открыть закрытый тикет.
+    Reopen {
+        at: Timestamp,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

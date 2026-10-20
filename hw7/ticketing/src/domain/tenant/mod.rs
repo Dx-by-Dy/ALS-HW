@@ -199,12 +199,12 @@ mod tests {
     #[test]
     fn apply_discount_emits_event_with_previous_and_new_rate() {
         assert_eq!(
-            registered().decide(&TenantCommand::ApplyDiscount { open_tickets: 4 }),
+            registered().decide(&TenantCommand::ApplyDiscount { open_tickets: 6 }),
             Ok(TenantEvent::DiscountApplied(DiscountAppliedEvent {
                 tenant_id: TenantId(1),
                 previous_rate: DiscountRate::NONE,
-                discount_rate: DiscountRate::for_open_tickets(4),
-                open_tickets: 4,
+                discount_rate: DiscountRate::STANDARD,
+                open_tickets: 6,
             }))
         );
     }
@@ -212,7 +212,7 @@ mod tests {
     #[test]
     fn discount_applied_event_changes_rate() {
         let tenant = apply_discount(registered(), 7).unwrap();
-        assert_eq!(tenant.discount_rate(), DiscountRate::for_open_tickets(7));
+        assert_eq!(tenant.discount_rate(), DiscountRate::STANDARD);
     }
 
     #[test]
@@ -222,13 +222,21 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_discount_produces_no_event() {
-        let tenant = apply_discount(registered(), 4);
+    fn up_to_threshold_tenant_keeps_no_discount() {
         assert_eq!(
-            tenant.decide(&TenantCommand::ApplyDiscount { open_tickets: 5 }),
-            Err(TenantError::DiscountUnchanged(
-                DiscountRate::for_open_tickets(5)
-            ))
+            registered().decide(&TenantCommand::ApplyDiscount {
+                open_tickets: DiscountRate::THRESHOLD
+            }),
+            Err(TenantError::DiscountUnchanged(DiscountRate::NONE))
+        );
+    }
+
+    #[test]
+    fn unchanged_discount_produces_no_event() {
+        let tenant = apply_discount(registered(), 6);
+        assert_eq!(
+            tenant.decide(&TenantCommand::ApplyDiscount { open_tickets: 9 }),
+            Err(TenantError::DiscountUnchanged(DiscountRate::STANDARD))
         );
     }
 }

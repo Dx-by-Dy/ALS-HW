@@ -1,10 +1,24 @@
 use std::cell::Cell;
 use std::rc::Rc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::domain::time::Timestamp;
 
 pub trait Clock {
     fn now(&self) -> Timestamp;
+}
+
+/// Настоящие часы: секунды Unix-времени.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Timestamp {
+        let since_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is after the Unix epoch");
+        Timestamp(since_epoch.as_secs())
+    }
 }
 
 /// Часы, которые двигает вызывающий код. Клоны делят одно время:

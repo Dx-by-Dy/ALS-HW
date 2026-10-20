@@ -6,14 +6,17 @@ pub struct DiscountRate(u8);
 
 impl DiscountRate {
     pub const NONE: Self = Self(0);
+    /// Скидка тенанта, у которого открытых тикетов больше [`Self::THRESHOLD`].
+    pub const STANDARD: Self = Self(10);
+    /// Сколько открытых тикетов нужно превысить, чтобы получить скидку.
+    pub const THRESHOLD: usize = 5;
 
-    /// Политика скидок
+    /// Политика скидок: один порог.
     pub fn for_open_tickets(open_tickets: usize) -> Self {
-        match open_tickets {
-            0..=2 => Self(0),
-            3..=5 => Self(5),
-            6..=9 => Self(10),
-            _ => Self(15),
+        if open_tickets > Self::THRESHOLD {
+            Self::STANDARD
+        } else {
+            Self::NONE
         }
     }
 
@@ -33,12 +36,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rate_grows_with_open_tickets() {
-        assert_eq!(DiscountRate::for_open_tickets(0), DiscountRate::NONE);
-        assert_eq!(DiscountRate::for_open_tickets(2).percent(), 0);
-        assert_eq!(DiscountRate::for_open_tickets(3).percent(), 5);
-        assert_eq!(DiscountRate::for_open_tickets(6).percent(), 10);
-        assert_eq!(DiscountRate::for_open_tickets(10).percent(), 15);
-        assert_eq!(DiscountRate::for_open_tickets(1000).percent(), 15);
+    fn no_discount_up_to_threshold() {
+        for open_tickets in [0, 1, 5] {
+            assert_eq!(
+                DiscountRate::for_open_tickets(open_tickets),
+                DiscountRate::NONE
+            );
+        }
+    }
+
+    #[test]
+    fn discount_applies_above_threshold() {
+        for open_tickets in [6, 10, 1000] {
+            assert_eq!(
+                DiscountRate::for_open_tickets(open_tickets),
+                DiscountRate::STANDARD
+            );
+        }
+        assert_eq!(DiscountRate::STANDARD.percent(), 10);
     }
 }

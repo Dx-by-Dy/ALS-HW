@@ -71,6 +71,11 @@ pub struct CloseTicketCommand {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReopenTicketCommand {
+    pub ticket_id: TicketId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApplyDiscountCommand {
     pub tenant_id: TenantId,
 }

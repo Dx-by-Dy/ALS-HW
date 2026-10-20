@@ -4,7 +4,7 @@ use super::{
     clock::Clock,
     commands::{
         ApplyDiscountCommand, AssignAgentCommand, CloseTicketCommand, CreateTicketCommand,
-        RegisterTenantCommand, RegisterUserCommand,
+        RegisterTenantCommand, RegisterUserCommand, ReopenTicketCommand,
     },
     error::ServiceError,
     open_tickets::OpenTickets,
@@ -141,6 +141,14 @@ impl<C: Clock> TicketService<C> {
         )
     }
 
+    pub fn handle_reopen_ticket(
+        &mut self,
+        command: ReopenTicketCommand,
+    ) -> Result<TicketEvent, ServiceError> {
+        let at = self.clock.now();
+        self.execute_ticket(command.ticket_id, TicketCommand::Reopen { at })
+    }
+
     /// Закрывает все тикеты, простоявшие без активности дольше таймаута.
     pub fn close_inactive_tickets(&mut self) -> Result<Vec<TicketEvent>, ServiceError> {
         let now = self.clock.now();
@@ -181,6 +189,31 @@ impl<C: Clock> TicketService<C> {
         Ok(self.users.load(user_id.into())?)
     }
 
+    /// Все тикеты в порядке создания.
+    pub fn tickets(&self) -> Result<Vec<Ticket>, ServiceError> {
+        (1..self.next_ticket_id)
+            .filter_map(|id| self.ticket(TicketId(id)).transpose())
+            .collect()
+    }
+
+    /// Все тенанты в порядке регистрации.
+    pub fn tenants(&self) -> Result<Vec<Tenant>, ServiceError> {
+        (1..self.next_tenant_id)
+            .filter_map(|id| self.tenant(TenantId(id)).transpose())
+            .collect()
+    }
+
+    /// Все пользователи в порядке регистрации.
+    pub fn users(&self) -> Result<Vec<User>, ServiceError> {
+        (1..self.next_user_id)
+            .filter_map(|id| self.user(UserId(id)).transpose())
+            .collect()
+    }
+
+    pub fn open_tickets_count(&self, tenant_id: TenantId) -> usize {
+        self.open_tickets.count_for_tenant(tenant_id)
+    }
+
     fn execute_ticket(
         &mut self,
         ticket_id: TicketId,
@@ -200,7 +233,7 @@ mod tests {
         tenant::{DiscountAppliedEvent, DiscountRate, TenantError},
         ticket::{
             AgentAssignedEvent, INACTIVITY_TIMEOUT_SECS, TicketClosedEvent, TicketCreatedEvent,
-            TicketError, TicketStatus,
+            TicketError, TicketReopenedEvent, TicketStatus,
         },
         time::Timestamp,
         user::Role,
@@ -394,6 +427,66 @@ mod tests {
     }
 
     #[test]
+    fn reopen_ticket_emits_reopened_event() {
+        let mut f = fixture();
+        let ticket_id = f.create_ticket();
+        let reopen = ReopenTicketCommand { ticket_id };
+        assert_eq!(
+            f.service.handle_reopen_ticket(reopen),
+            Err(ServiceError::Ticket(TicketError::AlreadyOpen(ticket_id)))
+        );
+
+        f.service
+            .handle_close_ticket(CloseTicketCommand {
+                ticket_id,
+                reason: CloseReason::Resolved,
+            })
+            .unwrap();
+        f.clock.advance(60);
+        assert_eq!(
+            f.service.handle_reopen_ticket(reopen),
+            Ok(TicketEvent::Reopened(TicketReopenedEvent {
+                ticket_id,
+                tenant_id: f.tenant_id,
+                at: Timestamp(60),
+            }))
+        );
+        assert_eq!(f.status(ticket_id), TicketStatus::Open);
+        assert_eq!(f.service.open_tickets_count(f.tenant_id), 1);
+    }
+
+    #[test]
+    fn listings_return_everything_in_creation_order() {
+        let mut f = fixture();
+        let first = f.create_ticket();
+        let second = f.create_ticket();
+        let ids: Vec<_> = f
+            .service
+            .tickets()
+            .unwrap()
+            .iter()
+            .map(Ticket::ticket_id)
+            .collect();
+        assert_eq!(ids, [first, second]);
+        let users: Vec<_> = f
+            .service
+            .users()
+            .unwrap()
+            .iter()
+            .map(User::user_id)
+            .collect();
+        assert_eq!(users, [f.agent_id, f.customer_id]);
+        let tenants: Vec<_> = f
+            .service
+            .tenants()
+            .unwrap()
+            .iter()
+            .map(Tenant::tenant_id)
+            .collect();
+        assert_eq!(tenants, [f.tenant_id]);
+    }
+
+    #[test]
     fn manual_close_for_inactivity_requires_timeout() {
         let mut f = fixture();
         let ticket_id = f.create_ticket();
@@ -451,19 +544,19 @@ mod tests {
     #[test]
     fn discount_follows_number_of_open_tickets() {
         let mut f = fixture();
-        let tickets: Vec<_> = (0..3).map(|_| f.create_ticket()).collect();
+        let tickets: Vec<_> = (0..6).map(|_| f.create_ticket()).collect();
 
         assert_eq!(
             f.apply_discount(),
             Ok(TenantEvent::DiscountApplied(DiscountAppliedEvent {
                 tenant_id: f.tenant_id,
                 previous_rate: DiscountRate::NONE,
-                discount_rate: DiscountRate::for_open_tickets(3),
-                open_tickets: 3,
+                discount_rate: DiscountRate::STANDARD,
+                open_tickets: 6,
             }))
         );
         let tenant = f.service.tenant(f.tenant_id).unwrap().unwrap();
-        assert_eq!(tenant.discount_rate(), DiscountRate::for_open_tickets(3));
+        assert_eq!(tenant.discount_rate(), DiscountRate::STANDARD);
 
         f.service
             .handle_close_ticket(CloseTicketCommand {
@@ -474,8 +567,19 @@ mod tests {
         let Ok(TenantEvent::DiscountApplied(event)) = f.apply_discount() else {
             panic!("discount goes down after closing a ticket");
         };
-        assert_eq!(event.open_tickets, 2);
+        assert_eq!(event.open_tickets, 5);
         assert_eq!(event.discount_rate, DiscountRate::NONE);
+
+        f.service
+            .handle_reopen_ticket(ReopenTicketCommand {
+                ticket_id: tickets[0],
+            })
+            .unwrap();
+        let Ok(TenantEvent::DiscountApplied(event)) = f.apply_discount() else {
+            panic!("reopened ticket counts again");
+        };
+        assert_eq!(event.open_tickets, 6);
+        assert_eq!(event.discount_rate, DiscountRate::STANDARD);
     }
 
     #[test]
@@ -508,7 +612,7 @@ mod tests {
             .register_tenant(RegisterTenantCommand::new("Globex"))
             .unwrap()
             .tenant_id();
-        for _ in 0..5 {
+        for _ in 0..=DiscountRate::THRESHOLD {
             f.service
                 .handle_create_ticket(CreateTicketCommand::new("Billing", "Invoice", other))
                 .unwrap();
