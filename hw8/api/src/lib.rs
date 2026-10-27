@@ -6,10 +6,6 @@ use serde::{Deserialize, Serialize};
 
 // Команды: POST, ответ — `CommandAcceptedDto`.
 
-pub fn apply_discount(tenant_id: usize) -> String {
-    format!("/api/tenants/{tenant_id}/discount")
-}
-
 pub fn open_ticket(ticket_id: usize) -> String {
     format!("/api/tickets/{ticket_id}/open")
 }

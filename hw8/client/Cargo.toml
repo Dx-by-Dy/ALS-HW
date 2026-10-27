@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 api = { path = "../api" }
 console_error_panic_hook = "0.1"
+futures = "0.3"
 gloo-net = { version = "0.6", default-features = false, features = ["http"] }
 leptos = { version = "0.8", features = ["csr"] }
 serde = "1"

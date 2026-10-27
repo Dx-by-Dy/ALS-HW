@@ -2,11 +2,14 @@
 //!
 //! Данные — DTO из общего crate `api`, отдельной копии структур на клиенте нет.
 //! Источник истины — сервер: клиент проверяет команды заранее, чтобы не слать
-//! заведомо отклонённые запросы, а состояние после команды берёт из ответа сервера.
+//! заведомо отклонённые запросы, а состояние держит в [`replica::Replica`] — копии
+//! read-модели сервера, которую обновляет long polling.
 
+pub mod backoff;
 pub mod http;
 #[cfg(test)]
 pub mod mock_http;
+pub mod replica;
 pub mod ticket_api;
 
 use std::error::Error;
@@ -93,6 +96,7 @@ impl Error for ValidationError {}
 #[cfg(test)]
 pub mod fixtures {
     use super::*;
+    use api::ChangesDto;
 
     pub fn ticket(id: usize, status: TicketStatus) -> TicketDto {
         TicketDto {
@@ -112,6 +116,16 @@ pub mod fixtures {
             user_id: id,
             user_name: name.to_owned(),
             role,
+        }
+    }
+
+    pub fn changes(epoch: u64, version: u64, full: bool, tickets: Vec<TicketDto>) -> ChangesDto {
+        ChangesDto {
+            epoch,
+            version,
+            full,
+            tickets,
+            ..ChangesDto::default()
         }
     }
 }

@@ -1,27 +1,40 @@
 //! ViewModel: состояние формы в реактивных сигналах, проверка доступности команд и сами команды.
 //!
 //! Представление читает свойства (`tickets`, `selected`, `can_close`, ...) внутри реактивных
-//! замыканий и перерисовывается, когда меняются сигналы. Команды асинхронные: пока запрос
-//! в полёте, `is_busy` блокирует остальные команды, а интерфейс продолжает отвечать.
+//! замыканий и перерисовывается, когда меняются сигналы.
+//!
+//! Состояние — копия read-модели сервера ([`Replica`]), её обновляет цикл long polling
+//! [`sync_forever`](TicketViewModel::sync_forever). Команды состояние не трогают: сервер
+//! отвечает версией, и модель остаётся занятой, пока поток изменений не дойдёт до этой версии.
+//! Так клиент видит результат своей команды тем же путём, что и изменения других клиентов.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use api::{TenantDto, TicketDto, UserDto};
+use api::{CommandAcceptedDto, Role, TenantDto, TicketDto, UserDto};
 use leptos::prelude::*;
 
 use crate::model::TicketRules;
+use crate::model::backoff::Backoff;
 use crate::model::http::HttpClient;
-use crate::model::ticket_api::{ApiError, TicketApiService};
+use crate::model::replica::Replica;
+use crate::model::ticket_api::{ApiError, TicketApiService, TicketQuery};
 
 pub struct TicketViewModel<H: 'static> {
     api: StoredValue<Arc<TicketApiService<H>>>,
-    tickets: RwSignal<Vec<TicketDto>>,
-    users: RwSignal<Vec<UserDto>>,
-    tenants: RwSignal<Vec<TenantDto>>,
+    replica: RwSignal<Replica>,
     selected_ticket: RwSignal<Option<usize>>,
     selected_user: RwSignal<Option<usize>>,
-    busy: RwSignal<bool>,
+    /// Команда отправлена, ответа ещё нет.
+    sending: RwSignal<bool>,
+    /// Версия своей последней команды, до которой копия ещё не дошла.
+    pending: RwSignal<Option<u64>>,
+    /// Последний запрос изменений прошёл успешно.
+    connected: RwSignal<bool>,
     error: RwSignal<Option<String>>,
+    query: RwSignal<Option<TicketQuery>>,
+    query_results: RwSignal<Vec<TicketDto>>,
+    query_error: RwSignal<Option<String>>,
 }
 
 // Все поля — дескрипторы сигналов, поэтому модель копируется в замыкания представления
@@ -38,34 +51,45 @@ impl<H: HttpClient + Send + Sync + 'static> TicketViewModel<H> {
     pub fn new(api: TicketApiService<H>) -> Self {
         Self {
             api: StoredValue::new(Arc::new(api)),
-            tickets: RwSignal::new(Vec::new()),
-            users: RwSignal::new(Vec::new()),
-            tenants: RwSignal::new(Vec::new()),
+            replica: RwSignal::new(Replica::default()),
             selected_ticket: RwSignal::new(None),
             selected_user: RwSignal::new(None),
-            busy: RwSignal::new(false),
+            sending: RwSignal::new(false),
+            pending: RwSignal::new(None),
+            connected: RwSignal::new(false),
             error: RwSignal::new(None),
+            query: RwSignal::new(None),
+            query_results: RwSignal::new(Vec::new()),
+            query_error: RwSignal::new(None),
         }
     }
 
     // --- Свойства для привязки ---
 
     pub fn tickets(&self) -> Vec<TicketDto> {
-        self.tickets.get()
+        self.replica.with(|r| r.tickets().cloned().collect())
     }
 
     pub fn users(&self) -> Vec<UserDto> {
-        self.users.get()
+        self.replica.with(|r| r.users().cloned().collect())
+    }
+
+    pub fn agents(&self) -> Vec<UserDto> {
+        self.replica.with(|r| {
+            r.users()
+                .filter(|u| u.role == Role::Agent)
+                .cloned()
+                .collect()
+        })
     }
 
     pub fn tenants(&self) -> Vec<TenantDto> {
-        self.tenants.get()
+        self.replica.with(|r| r.tenants().cloned().collect())
     }
 
     pub fn selected(&self) -> Option<TicketDto> {
         let id = self.selected_ticket.get()?;
-        self.tickets
-            .with(|tickets| tickets.iter().find(|t| t.ticket_id == id).cloned())
+        self.replica.with(|r| r.ticket(id).cloned())
     }
 
     pub fn is_selected(&self, ticket_id: usize) -> bool {
@@ -76,8 +100,18 @@ impl<H: HttpClient + Send + Sync + 'static> TicketViewModel<H> {
         self.selected_user.get()
     }
 
+    /// Команда в полёте или её результат ещё не пришёл с сервера.
     pub fn is_busy(&self) -> bool {
-        self.busy.get()
+        self.sending.get() || self.pending.get().is_some()
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.connected.get()
+    }
+
+    /// До какой версии сервера дошла копия.
+    pub fn version(&self) -> Option<u64> {
+        self.replica.with(Replica::version)
     }
 
     pub fn error(&self) -> Option<String> {
@@ -85,17 +119,24 @@ impl<H: HttpClient + Send + Sync + 'static> TicketViewModel<H> {
     }
 
     pub fn user_name(&self, user_id: usize) -> Option<String> {
-        self.users.with(|users| {
-            users
-                .iter()
-                .find(|u| u.user_id == user_id)
-                .map(|u| u.user_name.clone())
-        })
+        self.replica
+            .with(|r| r.user(user_id).map(|u| u.user_name.clone()))
     }
 
     pub fn tenant(&self, tenant_id: usize) -> Option<TenantDto> {
-        self.tenants
-            .with(|tenants| tenants.iter().find(|t| t.tenant_id == tenant_id).cloned())
+        self.replica.with(|r| r.tenant(tenant_id).cloned())
+    }
+
+    pub fn query(&self) -> Option<TicketQuery> {
+        self.query.get()
+    }
+
+    pub fn query_results(&self) -> Vec<TicketDto> {
+        self.query_results.get()
+    }
+
+    pub fn query_error(&self) -> Option<String> {
+        self.query_error.get()
     }
 
     pub fn select_ticket(&self, ticket_id: usize) {
@@ -129,33 +170,74 @@ impl<H: HttpClient + Send + Sync + 'static> TicketViewModel<H> {
     fn assignment(&self) -> Option<Result<(TicketDto, UserDto), String>> {
         let ticket = self.selected()?;
         let user_id = self.selected_user.get()?;
-        let user = self
-            .users
-            .with(|users| users.iter().find(|u| u.user_id == user_id).cloned())?;
+        let user = self.replica.with(|r| r.user(user_id).cloned())?;
         Some(match ticket.validate_assign(&user) {
             Ok(()) => Ok((ticket, user)),
             Err(e) => Err(e.to_string()),
         })
     }
 
-    // --- Команды ---
+    // --- Синхронизация с сервером ---
 
-    /// Загружает тикеты, пользователей и тенантов; выбирает первый тикет, если ничего не выбрано.
-    pub async fn load(&self) {
-        let api = self.api.get_value();
-        self.run(async {
-            let tickets = api.tickets().await?;
-            self.users.set(api.users().await?);
-            self.tenants.set(api.tenants().await?);
-            if self.selected_ticket.get_untracked().is_none() {
-                self.selected_ticket
-                    .set(tickets.first().map(|t| t.ticket_id));
+    /// Бесконечный цикл long polling. После обрыва связи пробует снова с нарастающей паузой;
+    /// `sleep` — таймер платформы (в браузере `setTimeout`).
+    pub async fn sync_forever<F: Future<Output = ()>>(&self, sleep: impl Fn(Duration) -> F) {
+        let mut backoff = Backoff::default();
+        loop {
+            match self.poll_once().await {
+                Ok(()) => backoff.succeeded(),
+                Err(_) => sleep(backoff.failed()).await,
             }
-            self.tickets.set(tickets);
-            Ok(())
-        })
-        .await;
+        }
     }
+
+    /// Один шаг long polling: получает изменения после текущей позиции и применяет их.
+    /// Если изменились данные, а в панели запросов выбран запрос, обновляет и его.
+    pub async fn poll_once(&self) -> Result<(), ApiError> {
+        let api = self.api.get_value();
+        let after = self.replica.with_untracked(Replica::cursor);
+        let changes = match api.changes(after).await {
+            Ok(changes) => changes,
+            Err(e) => {
+                self.connected.set(false);
+                return Err(e);
+            }
+        };
+        self.connected.set(true);
+        let full = changes.full;
+        let changed = full
+            || !(changes.tickets.is_empty()
+                && changes.tenants.is_empty()
+                && changes.users.is_empty());
+        self.replica.update(|r| r.apply(changes));
+
+        let reached = self
+            .replica
+            .with_untracked(|r| match self.pending.get_untracked() {
+                Some(version) => r.has_reached(version),
+                None => false,
+            });
+        // После полной перезагрузки версия своей команды из прошлого запуска уже не придёт.
+        if full || reached {
+            self.pending.set(None);
+        }
+        let selected_exists = self
+            .selected_ticket
+            .get_untracked()
+            .is_some_and(|id| self.replica.with_untracked(|r| r.ticket(id).is_some()));
+        if !selected_exists {
+            let first = self
+                .replica
+                .with_untracked(|r| r.tickets().next().map(|t| t.ticket_id));
+            self.selected_ticket.set(first);
+        }
+        if changed {
+            self.refresh_query().await;
+        }
+        Ok(())
+    }
+
+    // --- Команды ---
 
     pub async fn open_ticket(&self) {
         if !self.can_open() {
@@ -165,11 +247,7 @@ impl<H: HttpClient + Send + Sync + 'static> TicketViewModel<H> {
             return;
         };
         let api = self.api.get_value();
-        self.run(async {
-            let opened = api.open_ticket(&ticket).await?;
-            self.sync_after_status_change(&api, opened).await
-        })
-        .await;
+        self.run(api.open_ticket(&ticket)).await;
     }
 
     pub async fn close_ticket(&self) {
@@ -180,11 +258,7 @@ impl<H: HttpClient + Send + Sync + 'static> TicketViewModel<H> {
             return;
         };
         let api = self.api.get_value();
-        self.run(async {
-            let closed = api.close_ticket(&ticket).await?;
-            self.sync_after_status_change(&api, closed).await
-        })
-        .await;
+        self.run(api.close_ticket(&ticket)).await;
     }
 
     pub async fn assign_agent(&self) {
@@ -195,46 +269,48 @@ impl<H: HttpClient + Send + Sync + 'static> TicketViewModel<H> {
             return;
         };
         let api = self.api.get_value();
-        self.run(async {
-            let assigned = api.assign_agent(&ticket, &agent).await?;
-            self.replace_ticket(assigned);
-            Ok(())
-        })
-        .await;
+        self.run(api.assign_agent(&ticket, &agent)).await;
     }
 
-    /// Число открытых тикетов изменилось: синхронизируем тикет и пересчитываем скидку тенанта.
-    async fn sync_after_status_change(
-        &self,
-        api: &TicketApiService<H>,
-        ticket: TicketDto,
-    ) -> Result<(), ApiError> {
-        let tenant_id = ticket.tenant_id;
-        self.replace_ticket(ticket);
-        let tenant = api.apply_discount(tenant_id).await?;
-        self.tenants.update(|tenants| {
-            if let Some(t) = tenants.iter_mut().find(|t| t.tenant_id == tenant_id) {
-                *t = tenant;
-            }
-        });
-        Ok(())
+    /// Выбирает запрос в панели запросов и выполняет его.
+    pub async fn run_query(&self, query: TicketQuery) {
+        self.query.set(Some(query));
+        self.refresh_query().await;
     }
 
-    fn replace_ticket(&self, ticket: TicketDto) {
-        self.tickets.update(|tickets| {
-            if let Some(t) = tickets.iter_mut().find(|t| t.ticket_id == ticket.ticket_id) {
-                *t = ticket;
-            }
-        });
-    }
-
-    async fn run(&self, command: impl Future<Output = Result<(), ApiError>>) {
-        self.busy.set(true);
-        self.error.set(None);
-        if let Err(e) = command.await {
-            self.error.set(Some(e.to_string()));
+    async fn refresh_query(&self) {
+        let Some(query) = self.query.get_untracked() else {
+            return;
+        };
+        let result = self.api.get_value().query(query).await;
+        // Пока ответ шёл, могли выбрать другой запрос: тогда этот ответ уже не нужен.
+        if self.query.get_untracked() != Some(query) {
+            return;
         }
-        self.busy.set(false);
+        match result {
+            Ok(tickets) => {
+                self.query_results.set(tickets);
+                self.query_error.set(None);
+            }
+            Err(e) => self.query_error.set(Some(e.to_string())),
+        }
+    }
+
+    async fn run(&self, command: impl Future<Output = Result<CommandAcceptedDto, ApiError>>) {
+        self.sending.set(true);
+        self.error.set(None);
+        match command.await {
+            Ok(accepted) => {
+                let seen = self
+                    .replica
+                    .with_untracked(|r| r.has_reached(accepted.version));
+                if !seen {
+                    self.pending.set(Some(accepted.version));
+                }
+            }
+            Err(e) => self.error.set(Some(e.to_string())),
+        }
+        self.sending.set(false);
     }
 }
 
@@ -243,22 +319,13 @@ mod tests {
     use futures::executor::block_on;
 
     use super::*;
+    use crate::model::fixtures::{changes, ticket, user};
     use crate::model::http::HttpRequest;
     use crate::model::mock_http::MockHttpClient;
-    use api::{Role, TicketStatus};
+    use api::{ChangesDto, TicketStatus};
 
-    fn ticket_dto(id: usize, status: TicketStatus) -> TicketDto {
-        TicketDto {
-            ticket_id: id,
-            category: "Technical Issue".to_owned(),
-            description: format!("Problem {id}"),
-            status,
-            assigned_agent: None,
-            tenant_id: 1,
-            created_at: 0,
-            closed_at: None,
-        }
-    }
+    const EPOCH: u64 = 1;
+    const LOADED: u64 = 10;
 
     fn tenant_dto(open_tickets: usize, discount_percent: u8) -> TenantDto {
         TenantDto {
@@ -269,34 +336,34 @@ mod tests {
         }
     }
 
-    /// Модель после `load`: тикет 1 открыт и выбран, тикет 2 закрыт.
+    fn delta(version: u64, tickets: Vec<TicketDto>) -> ChangesDto {
+        changes(EPOCH, version, false, tickets)
+    }
+
+    /// Модель после первого запроса изменений: тикет 1 открыт и выбран, тикет 2 закрыт.
     fn loaded() -> (TicketViewModel<MockHttpClient>, MockHttpClient) {
         let http = MockHttpClient::default();
         http.respond_json(
             200,
-            &[
-                ticket_dto(1, TicketStatus::Open),
-                ticket_dto(2, TicketStatus::Closed),
-            ],
-        )
-        .respond_json(
-            200,
-            &[
-                UserDto {
-                    user_id: 1,
-                    user_name: "Alice".to_owned(),
-                    role: Role::Agent,
-                },
-                UserDto {
-                    user_id: 2,
-                    user_name: "Bob".to_owned(),
-                    role: Role::Customer,
-                },
-            ],
-        )
-        .respond_json(200, &[tenant_dto(6, 10)]);
+            &ChangesDto {
+                users: vec![
+                    user(1, "Alice", Role::Agent),
+                    user(2, "Bob", Role::Customer),
+                ],
+                tenants: vec![tenant_dto(6, 10)],
+                ..changes(
+                    EPOCH,
+                    LOADED,
+                    true,
+                    vec![
+                        ticket(1, TicketStatus::Open),
+                        ticket(2, TicketStatus::Closed),
+                    ],
+                )
+            },
+        );
         let vm = TicketViewModel::new(TicketApiService::new(http.clone()));
-        block_on(vm.load());
+        block_on(vm.poll_once()).unwrap();
         (vm, http)
     }
 
@@ -305,16 +372,57 @@ mod tests {
         tickets.iter().find(|t| t.ticket_id == id).unwrap().status
     }
 
+    fn last_request(http: &MockHttpClient) -> HttpRequest {
+        http.requests().pop().unwrap()
+    }
+
     #[test]
-    fn load_fills_state_and_selects_first_ticket() {
+    fn first_poll_fills_state_and_selects_first_ticket() {
         let (vm, http) = loaded();
         assert_eq!(vm.tickets().len(), 2);
         assert_eq!(vm.users().len(), 2);
+        assert_eq!(vm.agents().len(), 1);
         assert_eq!(vm.tenant(1).unwrap().discount_percent, 10);
         assert_eq!(vm.selected().unwrap().ticket_id, 1);
-        assert_eq!(http.requests().len(), 3);
+        assert_eq!(vm.version(), Some(LOADED));
+        assert!(vm.is_connected());
+        assert_eq!(http.requests(), [HttpRequest::get("/api/changes")]);
         assert!(!vm.is_busy());
-        assert_eq!(vm.error(), None);
+    }
+
+    #[test]
+    fn next_poll_continues_from_cursor_and_applies_changes_of_others() {
+        let (vm, http) = loaded();
+        let mut closed = ticket(1, TicketStatus::Closed);
+        closed.closed_at = Some(100);
+        http.respond_json(
+            200,
+            &ChangesDto {
+                tenants: vec![tenant_dto(5, 0)],
+                ..delta(11, vec![closed])
+            },
+        );
+
+        block_on(vm.poll_once()).unwrap();
+
+        assert_eq!(last_request(&http).path, "/api/changes?epoch=1&since=10");
+        assert_eq!(status(&vm, 1), TicketStatus::Closed);
+        assert_eq!(vm.tenant(1).unwrap().discount_percent, 0);
+        assert_eq!(vm.version(), Some(11));
+        assert!(vm.can_open());
+    }
+
+    #[test]
+    fn lost_connection_is_reported_and_state_kept() {
+        let (vm, http) = loaded();
+        http.fail("connection refused");
+        assert!(block_on(vm.poll_once()).is_err());
+        assert!(!vm.is_connected());
+        assert_eq!(vm.tickets().len(), 2);
+
+        http.respond_json(200, &delta(LOADED, vec![]));
+        block_on(vm.poll_once()).unwrap();
+        assert!(vm.is_connected());
     }
 
     #[test]
@@ -335,7 +443,7 @@ mod tests {
 
         let (vm, _) = loaded();
         vm.select_user(Some(1));
-        vm.busy.set(true);
+        vm.pending.set(Some(LOADED + 1));
         assert!(!vm.can_open() && !vm.can_close() && !vm.can_assign());
     }
 
@@ -358,37 +466,74 @@ mod tests {
     }
 
     #[test]
-    fn close_syncs_ticket_and_discount() {
+    fn command_keeps_model_busy_until_its_version_arrives() {
         let (vm, http) = loaded();
-        http.respond_json(200, &ticket_dto(1, TicketStatus::Closed))
-            .respond_json(200, &tenant_dto(5, 0));
+        http.respond_json(200, &CommandAcceptedDto { version: 12 });
 
         block_on(vm.close_ticket());
 
+        assert_eq!(
+            last_request(&http),
+            HttpRequest::post("/api/tickets/1/close", None)
+        );
+        // Сервер принял команду, но состояние приходит только через поток изменений.
+        assert!(vm.is_busy());
+        assert_eq!(status(&vm, 1), TicketStatus::Open);
+
+        // Сначала пришло чужое изменение, своё ещё нет.
+        http.respond_json(200, &delta(11, vec![ticket(2, TicketStatus::Open)]));
+        block_on(vm.poll_once()).unwrap();
+        assert!(vm.is_busy());
+
+        http.respond_json(
+            200,
+            &ChangesDto {
+                tenants: vec![tenant_dto(5, 0)],
+                ..delta(12, vec![ticket(1, TicketStatus::Closed)])
+            },
+        );
+        block_on(vm.poll_once()).unwrap();
+        assert!(!vm.is_busy());
         assert_eq!(status(&vm, 1), TicketStatus::Closed);
         assert_eq!(vm.tenant(1).unwrap().discount_percent, 0);
-        assert_eq!(
-            http.requests()[3..],
-            [
-                HttpRequest::post("/api/tickets/1/close", None),
-                HttpRequest::post("/api/tenants/1/discount", None),
-            ]
-        );
         assert!(vm.can_open());
+    }
+
+    #[test]
+    fn command_already_seen_does_not_block() {
+        let (vm, http) = loaded();
+        http.respond_json(200, &CommandAcceptedDto { version: LOADED });
+        block_on(vm.close_ticket());
         assert!(!vm.is_busy());
     }
 
     #[test]
-    fn open_syncs_ticket() {
+    fn server_restart_releases_pending_command() {
+        let (vm, http) = loaded();
+        http.respond_json(200, &CommandAcceptedDto { version: 12 });
+        block_on(vm.close_ticket());
+
+        http.respond_json(
+            200,
+            &changes(EPOCH + 1, 3, true, vec![ticket(1, TicketStatus::Open)]),
+        );
+        block_on(vm.poll_once()).unwrap();
+
+        assert!(!vm.is_busy());
+        assert_eq!(vm.tickets().len(), 1);
+        assert_eq!(vm.version(), Some(3));
+    }
+
+    #[test]
+    fn selection_moves_to_first_ticket_when_selected_one_disappears() {
         let (vm, http) = loaded();
         vm.select_ticket(2);
-        http.respond_json(200, &ticket_dto(2, TicketStatus::Open))
-            .respond_json(200, &tenant_dto(7, 10));
-
-        block_on(vm.open_ticket());
-
-        assert_eq!(status(&vm, 2), TicketStatus::Open);
-        assert_eq!(vm.tenant(1).unwrap().open_tickets, 7);
+        http.respond_json(
+            200,
+            &changes(EPOCH + 1, 1, true, vec![ticket(1, TicketStatus::Open)]),
+        );
+        block_on(vm.poll_once()).unwrap();
+        assert_eq!(vm.selected().unwrap().ticket_id, 1);
     }
 
     #[test]
@@ -413,26 +558,58 @@ mod tests {
         block_on(vm.open_ticket());
         vm.select_user(Some(2));
         block_on(vm.assign_agent());
-        assert_eq!(http.requests().len(), 3);
+        assert_eq!(http.requests().len(), 1);
     }
 
     #[test]
-    fn assign_updates_ticket() {
+    fn assign_sends_selected_agent() {
         let (vm, http) = loaded();
         vm.select_user(Some(1));
-        http.respond_json(
-            200,
-            &TicketDto {
-                assigned_agent: Some(1),
-                ..ticket_dto(1, TicketStatus::InProgress)
-            },
-        );
+        http.respond_json(200, &CommandAcceptedDto { version: 11 });
 
         block_on(vm.assign_agent());
 
-        let ticket = vm.selected().unwrap();
-        assert_eq!(ticket.status, TicketStatus::InProgress);
-        assert_eq!(ticket.assigned_agent, Some(1));
-        assert!(!vm.can_assign());
+        let request = last_request(&http);
+        assert_eq!(request.path, "/api/tickets/1/assign");
+        assert!(vm.is_busy());
+    }
+
+    #[test]
+    fn query_results_follow_changes() {
+        let (vm, http) = loaded();
+        http.respond_json(200, &[ticket(2, TicketStatus::Closed)]);
+        block_on(vm.run_query(TicketQuery::ClosedWithin(7)));
+        assert_eq!(last_request(&http).path, "/api/tickets/closed?days=7");
+        assert_eq!(vm.query(), Some(TicketQuery::ClosedWithin(7)));
+        assert_eq!(vm.query_results().len(), 1);
+
+        // Данные изменились — выбранный запрос выполняется заново.
+        http.respond_json(200, &delta(11, vec![ticket(1, TicketStatus::Closed)]))
+            .respond_json(
+                200,
+                &[
+                    ticket(1, TicketStatus::Closed),
+                    ticket(2, TicketStatus::Closed),
+                ],
+            );
+        block_on(vm.poll_once()).unwrap();
+        assert_eq!(vm.query_results().len(), 2);
+
+        // Пустой ответ long polling запрос не трогает.
+        http.respond_json(200, &delta(11, vec![]));
+        block_on(vm.poll_once()).unwrap();
+        assert_eq!(http.requests().len(), 5);
+    }
+
+    #[test]
+    fn query_error_is_shown_separately() {
+        let (vm, http) = loaded();
+        http.respond_error(500, "storage error");
+        block_on(vm.run_query(TicketQuery::ActiveOfAgent(1)));
+        assert_eq!(
+            vm.query_error().as_deref(),
+            Some("server rejected the request (500): storage error")
+        );
+        assert_eq!(vm.error(), None);
     }
 }

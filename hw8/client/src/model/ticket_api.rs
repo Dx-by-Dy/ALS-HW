@@ -1,9 +1,13 @@
-//! Сервис связи с бэкендом: отправляет команды на сервер и возвращает состояние из его ответа.
+//! Сервис связи с бэкендом. Команды отправляются на командную сторону и возвращают
+//! только версию, состояние приходит через long polling (`changes`), а запросы
+//! ([`TicketQuery`]) читают read-модель сервера.
 
 use std::error::Error;
 use std::fmt;
 
-use api::{AssignAgentRequest, ErrorDto, TenantDto, TicketDto, UserDto};
+use api::{
+    AssignAgentRequest, ChangesDto, CommandAcceptedDto, Cursor, ErrorDto, TicketDto, UserDto,
+};
 use serde::de::DeserializeOwned;
 
 use super::http::{HttpClient, HttpRequest, TransportError};
@@ -44,6 +48,27 @@ impl From<ValidationError> for ApiError {
     }
 }
 
+/// Запрос к read-модели сервера.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TicketQuery {
+    /// Незакрытые тикеты, назначенные на агента.
+    ActiveOfAgent(usize),
+    /// Открытые тикеты тенанта, которые ещё никто не взял в работу.
+    UnassignedOfTenant(usize),
+    /// Тикеты, закрытые за последние N дней.
+    ClosedWithin(u64),
+}
+
+impl TicketQuery {
+    pub fn path(self) -> String {
+        match self {
+            Self::ActiveOfAgent(agent_id) => api::active_tickets_of_agent(agent_id),
+            Self::UnassignedOfTenant(tenant_id) => api::unassigned_tickets_of_tenant(tenant_id),
+            Self::ClosedWithin(days) => api::tickets_closed_within(days),
+        }
+    }
+}
+
 pub struct TicketApiService<H> {
     http: H,
 }
@@ -53,27 +78,25 @@ impl<H: HttpClient> TicketApiService<H> {
         Self { http }
     }
 
-    pub async fn tickets(&self) -> Result<Vec<TicketDto>, ApiError> {
-        self.request(HttpRequest::get(api::TICKETS)).await
+    /// Long polling: изменения после позиции `after`; без позиции — всё состояние сразу.
+    /// Если изменений нет, сервер держит запрос до своего таймаута.
+    pub async fn changes(&self, after: Option<Cursor>) -> Result<ChangesDto, ApiError> {
+        self.request(HttpRequest::get(api::changes(after))).await
     }
 
-    pub async fn users(&self) -> Result<Vec<UserDto>, ApiError> {
-        self.request(HttpRequest::get(api::USERS)).await
+    pub async fn query(&self, query: TicketQuery) -> Result<Vec<TicketDto>, ApiError> {
+        self.request(HttpRequest::get(query.path())).await
     }
 
-    pub async fn tenants(&self) -> Result<Vec<TenantDto>, ApiError> {
-        self.request(HttpRequest::get(api::TENANTS)).await
-    }
-
-    /// Открывает закрытый тикет и возвращает его состояние после команды.
-    pub async fn open_ticket(&self, ticket: &TicketDto) -> Result<TicketDto, ApiError> {
+    /// Открывает закрытый тикет. Ответ — версия, с которой результат виден в `changes`.
+    pub async fn open_ticket(&self, ticket: &TicketDto) -> Result<CommandAcceptedDto, ApiError> {
         ticket.validate_open()?;
         let path = api::open_ticket(ticket.ticket_id);
         self.request(HttpRequest::post(path, None)).await
     }
 
-    /// Закрывает открытый тикет и возвращает его состояние после команды.
-    pub async fn close_ticket(&self, ticket: &TicketDto) -> Result<TicketDto, ApiError> {
+    /// Закрывает открытый тикет. Ответ — версия, с которой результат виден в `changes`.
+    pub async fn close_ticket(&self, ticket: &TicketDto) -> Result<CommandAcceptedDto, ApiError> {
         ticket.validate_close()?;
         let path = api::close_ticket(ticket.ticket_id);
         self.request(HttpRequest::post(path, None)).await
@@ -83,7 +106,7 @@ impl<H: HttpClient> TicketApiService<H> {
         &self,
         ticket: &TicketDto,
         agent: &UserDto,
-    ) -> Result<TicketDto, ApiError> {
+    ) -> Result<CommandAcceptedDto, ApiError> {
         ticket.validate_assign(agent)?;
         let body = AssignAgentRequest {
             agent_id: agent.user_id,
@@ -91,12 +114,6 @@ impl<H: HttpClient> TicketApiService<H> {
         let body = serde_json::to_string(&body).expect("request serializes to JSON");
         let path = api::assign_agent(ticket.ticket_id);
         self.request(HttpRequest::post(path, Some(body))).await
-    }
-
-    /// Пересчитывает скидку тенанта по числу его открытых тикетов.
-    pub async fn apply_discount(&self, tenant_id: usize) -> Result<TenantDto, ApiError> {
-        let path = api::apply_discount(tenant_id);
-        self.request(HttpRequest::post(path, None)).await
     }
 
     async fn request<T: DeserializeOwned>(&self, request: HttpRequest) -> Result<T, ApiError> {
@@ -118,7 +135,7 @@ mod tests {
     use futures::executor::block_on;
 
     use super::*;
-    use crate::model::fixtures::{ticket, user};
+    use crate::model::fixtures::{changes, ticket, user};
     use crate::model::http::Method;
     use crate::model::mock_http::MockHttpClient;
     use api::{Role, TicketStatus};
@@ -128,28 +145,17 @@ mod tests {
         (TicketApiService::new(http.clone()), http)
     }
 
-    fn dto(id: usize, status: TicketStatus, agent: Option<usize>) -> TicketDto {
-        TicketDto {
-            ticket_id: id,
-            category: "Technical Issue".to_owned(),
-            description: "VPN is down".to_owned(),
-            status,
-            assigned_agent: agent,
-            tenant_id: 1,
-            created_at: 0,
-            closed_at: None,
-        }
+    fn accepted(version: u64) -> CommandAcceptedDto {
+        CommandAcceptedDto { version }
     }
 
     #[test]
-    fn close_success_returns_closed_ticket() {
+    fn close_success_returns_version() {
         let (service, http) = service();
-        http.respond_json(200, &dto(2, TicketStatus::Closed, None));
+        http.respond_json(200, &accepted(42));
 
         let open = ticket(2, TicketStatus::Open);
-        let closed = block_on(service.close_ticket(&open)).unwrap();
-
-        assert_eq!(closed.status, TicketStatus::Closed);
+        assert_eq!(block_on(service.close_ticket(&open)), Ok(accepted(42)));
         assert_eq!(
             http.requests(),
             [HttpRequest::post("/api/tickets/2/close", None)]
@@ -173,14 +179,12 @@ mod tests {
     }
 
     #[test]
-    fn open_success_returns_open_ticket() {
+    fn open_success_returns_version() {
         let (service, http) = service();
-        http.respond_json(200, &dto(7, TicketStatus::Open, None));
+        http.respond_json(200, &accepted(7));
 
         let closed = ticket(7, TicketStatus::Closed);
-        let opened = block_on(service.open_ticket(&closed)).unwrap();
-
-        assert_eq!(opened.status, TicketStatus::Open);
+        assert_eq!(block_on(service.open_ticket(&closed)), Ok(accepted(7)));
         assert_eq!(
             http.requests(),
             [HttpRequest::post("/api/tickets/7/open", None)]
@@ -249,14 +253,12 @@ mod tests {
     #[test]
     fn assign_sends_agent_id() {
         let (service, http) = service();
-        http.respond_json(200, &dto(2, TicketStatus::InProgress, Some(5)));
+        http.respond_json(200, &accepted(3));
 
         let alice = user(5, "Alice", Role::Agent);
-        let assigned = block_on(service.assign_agent(&ticket(2, TicketStatus::Open), &alice));
+        let result = block_on(service.assign_agent(&ticket(2, TicketStatus::Open), &alice));
 
-        let assigned = assigned.unwrap();
-        assert_eq!(assigned.assigned_agent, Some(5));
-        assert_eq!(assigned.status, TicketStatus::InProgress);
+        assert_eq!(result, Ok(accepted(3)));
         let request = &http.requests()[0];
         assert_eq!(request.method, Method::Post);
         assert_eq!(request.path, "/api/tickets/2/assign");
@@ -275,22 +277,39 @@ mod tests {
     }
 
     #[test]
-    fn apply_discount_returns_tenant_state() {
+    fn changes_are_asked_after_cursor() {
         let (service, http) = service();
-        let tenant = TenantDto {
-            tenant_id: 1,
-            tenant_name: "Acme".to_owned(),
-            discount_percent: 10,
-            open_tickets: 6,
-        };
-        http.respond_json(200, &tenant);
+        let all = changes(9, 20, true, vec![ticket(1, TicketStatus::Open)]);
+        http.respond_json(200, &all)
+            .respond_json(200, &changes(9, 21, false, vec![]));
 
-        let tenant = block_on(service.apply_discount(1)).unwrap();
+        assert_eq!(block_on(service.changes(None)), Ok(all.clone()));
+        block_on(service.changes(Some(all.cursor()))).unwrap();
+        let paths: Vec<_> = http.requests().into_iter().map(|r| r.path).collect();
+        assert_eq!(paths, ["/api/changes", "/api/changes?epoch=9&since=20"]);
+    }
 
-        assert_eq!(tenant.discount_percent, 10);
+    #[test]
+    fn queries_go_to_read_side_paths() {
+        let (service, http) = service();
+        for _ in 0..3 {
+            http.respond_json(200, &[ticket(4, TicketStatus::Closed)]);
+        }
+        for query in [
+            TicketQuery::ActiveOfAgent(1),
+            TicketQuery::UnassignedOfTenant(2),
+            TicketQuery::ClosedWithin(7),
+        ] {
+            assert_eq!(block_on(service.query(query)).unwrap().len(), 1);
+        }
+        let paths: Vec<_> = http.requests().into_iter().map(|r| r.path).collect();
         assert_eq!(
-            http.requests(),
-            [HttpRequest::post("/api/tenants/1/discount", None)]
+            paths,
+            [
+                "/api/agents/1/tickets",
+                "/api/tenants/2/tickets/unassigned",
+                "/api/tickets/closed?days=7",
+            ]
         );
     }
 }

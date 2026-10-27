@@ -59,6 +59,10 @@
       .topbar { display: flex; align-items: baseline; gap: 16px; }
       h1 { font-size: 22px; margin: 0 0 16px; }
       h2 { font-size: 17px; margin: 0; }
+      .live { font-size: 13px; color: var(--open); font-variant-numeric: tabular-nums; }
+      .live::before { content: "● "; }
+      .live.offline { color: var(--error); }
+      .live.offline::before { content: "○ "; }
       .sync { color: var(--muted); font-size: 13px; visibility: hidden; }
       .sync.visible { visibility: visible; }
       .tenants { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
@@ -94,7 +98,18 @@
       .actions, .assign-row { display: flex; gap: 8px; }
       .assign { display: flex; flex-direction: column; gap: 6px; }
       label { font-size: 13px; color: var(--muted); }
-      select, button { font: inherit; border-radius: 6px; padding: 7px 12px; }
+      .queries { margin-top: 16px; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+      .query-row {
+        display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+        padding: 6px 10px; border-radius: 8px; border: 1px solid transparent;
+      }
+      .query-row > span:first-child { min-width: 170px; color: var(--muted); }
+      .query-row.active { border-color: var(--accent); background: var(--selected); }
+      .query-row select { flex: 0 1 220px; }
+      .query-row input { width: 80px; }
+      .queries table { margin-top: 4px; }
+      select, button, input { font: inherit; border-radius: 6px; padding: 7px 12px; }
+      input { background: var(--panel); color: var(--text); border: 1px solid var(--border); }
       select { flex: 1; min-width: 0; background: var(--panel); color: var(--text); border: 1px solid var(--border); }
       button { border: 1px solid var(--accent); background: var(--accent); color: var(--accent-text); cursor: pointer; }
       button.danger { border-color: var(--danger); background: transparent; color: var(--danger); }
