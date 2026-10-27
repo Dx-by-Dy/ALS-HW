@@ -1490,7 +1490,10 @@ version = "0.1.0"
 dependencies = [
  "api",
  "axum",
+ "command",
+ "framework",
  "http-body-util",
+ "query",
  "serde",
  "serde_json",
  "ticketing",

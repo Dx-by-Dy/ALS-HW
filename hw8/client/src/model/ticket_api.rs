@@ -136,6 +136,8 @@ mod tests {
             status,
             assigned_agent: agent,
             tenant_id: 1,
+            created_at: 0,
+            closed_at: None,
         }
     }
 

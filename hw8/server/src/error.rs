@@ -4,6 +4,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use command::CommandError;
 use ticketing::application::error::ServiceError;
 use ticketing::domain::{tenant::TenantError, ticket::TicketError, user::UserError};
 
@@ -19,6 +20,18 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             message: message.into(),
+        }
+    }
+}
+
+impl From<CommandError> for ApiError {
+    fn from(e: CommandError) -> Self {
+        match e {
+            CommandError::Rejected(e) => e.into(),
+            CommandError::Unavailable => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: e.to_string(),
+            },
         }
     }
 }

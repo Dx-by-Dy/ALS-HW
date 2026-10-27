@@ -102,6 +102,8 @@ pub mod fixtures {
             status,
             assigned_agent: None,
             tenant_id: 1,
+            created_at: 0,
+            closed_at: None,
         }
     }
 
