@@ -11,10 +11,10 @@ const CLIENT_DIST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../client/dist")
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut service = TicketService::new(SystemClock);
-    seed(&mut service)?;
+    seed(&mut service).await?;
 
     if !Path::new(CLIENT_DIST).join("index.html").exists() {
-        eprintln!("warning: client is not built, run `trunk build` in hw7/client");
+        eprintln!("warning: client is not built, run `trunk build` in hw8/client");
     }
     let router = app(service).fallback_service(ServeDir::new(CLIENT_DIST));
 

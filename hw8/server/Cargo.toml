@@ -7,7 +7,7 @@ edition.workspace = true
 api = { path = "../api" }
 ticketing = { path = "../ticketing" }
 axum = "0.8"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync"] }
 tower-http = { version = "0.6", features = ["fs"] }
 
 [dev-dependencies]

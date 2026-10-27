@@ -57,30 +57,33 @@ where
     }
 
     /// Текущее состояние: последний снапшот плюс события после него.
-    pub fn load(&self, id: StreamId) -> Result<A, ES::Error> {
+    pub async fn load(&self, id: StreamId) -> Result<A, ES::Error> {
         let (state, pos) = self
             .snapshots
-            .load_latest_snapshot(id)?
+            .load_latest_snapshot(id)
+            .await?
             .unwrap_or_else(|| (A::default(), EventPos(0)));
-        Ok(state.recover(self.events.event_stream_from_pos(id, pos)?))
+        Ok(state.recover(self.events.event_stream_from_pos(id, pos).await?))
     }
 
     /// load → decide → store (→ snapshot). Возвращает записанное событие.
-    pub fn execute(
+    pub async fn execute(
         &mut self,
         id: StreamId,
         command: &A::Command,
     ) -> Result<A::Event, RepositoryError<A::Error, ES::Error>> {
-        let state = self.load(id).map_err(RepositoryError::Storage)?;
+        let state = self.load(id).await.map_err(RepositoryError::Storage)?;
         let event = state.decide(command).map_err(RepositoryError::Domain)?;
         let pos = self
             .events
             .store_event(id, event.clone())
+            .await
             .map_err(RepositoryError::Storage)?;
         if pos.0 % self.snapshot_every.get() == 0 {
             let state = state.apply_event(&event);
             self.snapshots
                 .save_snapshot(id, pos, state)
+                .await
                 .map_err(RepositoryError::Storage)?;
         }
         Ok(event)
@@ -138,73 +141,75 @@ mod tests {
         )
     }
 
-    fn full_replay(repo: &CounterRepository) -> Counter {
-        Counter::default().recover(repo.events.event_stream_from_pos(ID, EventPos(0)).unwrap())
+    async fn full_replay(repo: &CounterRepository) -> Counter {
+        let events = repo.events.event_stream_from_pos(ID, EventPos(0)).await;
+        Counter::default().recover(events.unwrap())
     }
 
-    #[test]
-    fn empty_stream_loads_default_state() {
-        assert_eq!(repository(2).load(ID), Ok(Counter(0)));
+    #[tokio::test]
+    async fn empty_stream_loads_default_state() {
+        assert_eq!(repository(2).load(ID).await, Ok(Counter(0)));
     }
 
-    #[test]
-    fn executed_command_is_stored_and_visible_on_load() {
+    #[tokio::test]
+    async fn executed_command_is_stored_and_visible_on_load() {
         let mut repo = repository(10);
-        assert_eq!(repo.execute(ID, &5), Ok(5));
-        assert_eq!(repo.execute(ID, &-2), Ok(-2));
-        assert_eq!(repo.load(ID), Ok(Counter(3)));
+        assert_eq!(repo.execute(ID, &5).await, Ok(5));
+        assert_eq!(repo.execute(ID, &-2).await, Ok(-2));
+        assert_eq!(repo.load(ID).await, Ok(Counter(3)));
     }
 
-    #[test]
-    fn rejected_command_stores_nothing() {
+    #[tokio::test]
+    async fn rejected_command_stores_nothing() {
         let mut repo = repository(10);
-        repo.execute(ID, &1).unwrap();
+        repo.execute(ID, &1).await.unwrap();
         assert_eq!(
-            repo.execute(ID, &-5),
+            repo.execute(ID, &-5).await,
             Err(RepositoryError::<_, StorageError>::Domain("negative"))
         );
-        assert_eq!(repo.load(ID), Ok(Counter(1)));
-        assert_eq!(full_replay(&repo), Counter(1));
+        assert_eq!(repo.load(ID).await, Ok(Counter(1)));
+        assert_eq!(full_replay(&repo).await, Counter(1));
     }
 
-    #[test]
-    fn snapshot_is_taken_when_stream_length_is_multiple_of_interval() {
+    #[tokio::test]
+    async fn snapshot_is_taken_when_stream_length_is_multiple_of_interval() {
         let mut repo = repository(2);
-        repo.execute(ID, &1).unwrap();
-        assert_eq!(repo.snapshots.load_latest_snapshot(ID), Ok(None));
-        repo.execute(ID, &2).unwrap();
+        repo.execute(ID, &1).await.unwrap();
+        assert_eq!(repo.snapshots.load_latest_snapshot(ID).await, Ok(None));
+        repo.execute(ID, &2).await.unwrap();
         assert_eq!(
-            repo.snapshots.load_latest_snapshot(ID),
+            repo.snapshots.load_latest_snapshot(ID).await,
             Ok(Some((Counter(3), EventPos(2))))
         );
-        repo.execute(ID, &3).unwrap();
-        repo.execute(ID, &4).unwrap();
+        repo.execute(ID, &3).await.unwrap();
+        repo.execute(ID, &4).await.unwrap();
         assert_eq!(
-            repo.snapshots.load_latest_snapshot(ID),
+            repo.snapshots.load_latest_snapshot(ID).await,
             Ok(Some((Counter(10), EventPos(4))))
         );
     }
 
-    #[test]
-    fn load_from_snapshot_equals_full_replay() {
+    #[tokio::test]
+    async fn load_from_snapshot_equals_full_replay() {
         let mut repo = repository(2);
         for delta in [1, 2, 3, -4, 5] {
-            repo.execute(ID, &delta).unwrap();
+            repo.execute(ID, &delta).await.unwrap();
         }
-        assert_eq!(repo.load(ID).unwrap(), full_replay(&repo));
+        assert_eq!(repo.load(ID).await.unwrap(), full_replay(&repo).await);
     }
 
-    #[test]
-    fn load_replays_only_events_after_snapshot() {
+    #[tokio::test]
+    async fn load_replays_only_events_after_snapshot() {
         let mut repo = repository(100);
         for delta in [1, 2, 3] {
-            repo.execute(ID, &delta).unwrap();
+            repo.execute(ID, &delta).await.unwrap();
         }
         // Подменяем снапшот на позиции 1: если load его использует,
         // то поверх 100 применятся только события 2 и 3.
         repo.snapshots
             .save_snapshot(ID, EventPos(1), Counter(100))
+            .await
             .unwrap();
-        assert_eq!(repo.load(ID), Ok(Counter(105)));
+        assert_eq!(repo.load(ID).await, Ok(Counter(105)));
     }
 }

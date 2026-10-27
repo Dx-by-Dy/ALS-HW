@@ -4,7 +4,7 @@ mod dto;
 mod error;
 mod seed;
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 use api::{AssignAgentRequest, TenantDto, TicketDto, UserDto};
 use axum::{
@@ -23,6 +23,7 @@ use ticketing::domain::{
     ticket::{CloseReason, TicketId},
     user::UserId,
 };
+use tokio::sync::{Mutex, MutexGuard};
 
 pub use error::ApiError;
 pub use seed::seed;
@@ -34,14 +35,12 @@ pub struct AppState<C> {
 }
 
 impl<C> AppState<C> {
-    fn service(&self) -> MutexGuard<'_, TicketService<C>> {
-        self.service
-            .lock()
-            .expect("ticket service lock is not poisoned")
+    async fn service(&self) -> MutexGuard<'_, TicketService<C>> {
+        self.service.lock().await
     }
 }
 
-pub fn app<C: Clock + Send + 'static>(service: TicketService<C>) -> Router {
+pub fn app<C: Clock + Send + Sync + 'static>(service: TicketService<C>) -> Router {
     let state = Arc::new(AppState {
         service: Mutex::new(service),
     });
@@ -59,18 +58,18 @@ pub fn app<C: Clock + Send + 'static>(service: TicketService<C>) -> Router {
 type Shared<C> = State<Arc<AppState<C>>>;
 
 async fn list_tickets<C: Clock>(State(state): Shared<C>) -> ApiResult<Vec<TicketDto>> {
-    let tickets = state.service().tickets()?;
+    let tickets = state.service().await.tickets().await?;
     Ok(Json(tickets.iter().map(dto::ticket_dto).collect()))
 }
 
 async fn list_users<C: Clock>(State(state): Shared<C>) -> ApiResult<Vec<UserDto>> {
-    let users = state.service().users()?;
+    let users = state.service().await.users().await?;
     Ok(Json(users.iter().map(dto::user_dto).collect()))
 }
 
 async fn list_tenants<C: Clock>(State(state): Shared<C>) -> ApiResult<Vec<TenantDto>> {
-    let service = state.service();
-    let tenants = service.tenants()?;
+    let service = state.service().await;
+    let tenants = service.tenants().await?;
     let dtos = tenants
         .iter()
         .map(|t| dto::tenant_dto(t, service.open_tickets_count(t.tenant_id())))
@@ -82,23 +81,27 @@ async fn open_ticket<C: Clock>(
     State(state): Shared<C>,
     Path(id): Path<usize>,
 ) -> ApiResult<TicketDto> {
-    let mut service = state.service();
+    let mut service = state.service().await;
     let ticket_id = TicketId(id);
-    service.handle_reopen_ticket(ReopenTicketCommand { ticket_id })?;
-    ticket_response(&service, ticket_id)
+    service
+        .handle_reopen_ticket(ReopenTicketCommand { ticket_id })
+        .await?;
+    ticket_response(&service, ticket_id).await
 }
 
 async fn close_ticket<C: Clock>(
     State(state): Shared<C>,
     Path(id): Path<usize>,
 ) -> ApiResult<TicketDto> {
-    let mut service = state.service();
+    let mut service = state.service().await;
     let ticket_id = TicketId(id);
-    service.handle_close_ticket(CloseTicketCommand {
-        ticket_id,
-        reason: CloseReason::Resolved,
-    })?;
-    ticket_response(&service, ticket_id)
+    service
+        .handle_close_ticket(CloseTicketCommand {
+            ticket_id,
+            reason: CloseReason::Resolved,
+        })
+        .await?;
+    ticket_response(&service, ticket_id).await
 }
 
 async fn assign_agent<C: Clock>(
@@ -106,13 +109,15 @@ async fn assign_agent<C: Clock>(
     Path(id): Path<usize>,
     Json(request): Json<AssignAgentRequest>,
 ) -> ApiResult<TicketDto> {
-    let mut service = state.service();
+    let mut service = state.service().await;
     let ticket_id = TicketId(id);
-    service.handle_assign_agent(AssignAgentCommand {
-        ticket_id,
-        agent_id: UserId(request.agent_id),
-    })?;
-    ticket_response(&service, ticket_id)
+    service
+        .handle_assign_agent(AssignAgentCommand {
+            ticket_id,
+            agent_id: UserId(request.agent_id),
+        })
+        .await?;
+    ticket_response(&service, ticket_id).await
 }
 
 /// Пересчитывает скидку. Для клиента операция идемпотентна: если скидка не изменилась,
@@ -121,14 +126,18 @@ async fn apply_discount<C: Clock>(
     State(state): Shared<C>,
     Path(id): Path<usize>,
 ) -> ApiResult<TenantDto> {
-    let mut service = state.service();
+    let mut service = state.service().await;
     let tenant_id = TenantId(id);
-    match service.handle_apply_discount(ApplyDiscountCommand { tenant_id }) {
+    match service
+        .handle_apply_discount(ApplyDiscountCommand { tenant_id })
+        .await
+    {
         Ok(_) | Err(ServiceError::Tenant(TenantError::DiscountUnchanged(_))) => {}
         Err(e) => return Err(e.into()),
     }
     let tenant = service
-        .tenant(tenant_id)?
+        .tenant(tenant_id)
+        .await?
         .ok_or_else(|| ApiError::not_found(format!("{tenant_id} does not exist")))?;
     Ok(Json(dto::tenant_dto(
         &tenant,
@@ -136,12 +145,13 @@ async fn apply_discount<C: Clock>(
     )))
 }
 
-fn ticket_response<C: Clock>(
+async fn ticket_response<C: Clock>(
     service: &TicketService<C>,
     ticket_id: TicketId,
 ) -> ApiResult<TicketDto> {
     let ticket = service
-        .ticket(ticket_id)?
+        .ticket(ticket_id)
+        .await?
         .ok_or_else(|| ApiError::not_found(format!("{ticket_id} does not exist")))?;
     Ok(Json(dto::ticket_dto(&ticket)))
 }
@@ -167,9 +177,9 @@ mod tests {
     const CUSTOMER_BOB: usize = 3;
     const ACME: usize = 1;
 
-    fn seeded_app() -> Router {
+    async fn seeded_app() -> Router {
         let mut service = TicketService::new(SystemClock);
-        seed(&mut service).unwrap();
+        seed(&mut service).await.unwrap();
         app(service)
     }
 
@@ -193,7 +203,7 @@ mod tests {
 
     #[tokio::test]
     async fn lists_seeded_state() {
-        let app = seeded_app();
+        let app = seeded_app().await;
         let (status, tickets): (_, Vec<TicketDto>) = send(&app, "GET", api::TICKETS, None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(tickets.len(), 9);
@@ -210,7 +220,7 @@ mod tests {
 
     #[tokio::test]
     async fn close_then_open_round_trip() {
-        let app = seeded_app();
+        let app = seeded_app().await;
         let (status, ticket): (_, TicketDto) =
             send(&app, "POST", &api::close_ticket(OPEN), None).await;
         assert_eq!(status, StatusCode::OK);
@@ -230,14 +240,14 @@ mod tests {
     #[tokio::test]
     async fn opening_open_ticket_conflicts() {
         let (status, error): (_, ErrorDto) =
-            send(&seeded_app(), "POST", &api::open_ticket(OPEN), None).await;
+            send(&seeded_app().await, "POST", &api::open_ticket(OPEN), None).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(error.error, "ticket-2 is already open");
     }
 
     #[tokio::test]
     async fn assign_accepts_only_agents() {
-        let app = seeded_app();
+        let app = seeded_app().await;
         let body = format!(r#"{{"agent_id":{AGENT_CAROL}}}"#);
         let (status, ticket): (_, TicketDto) =
             send(&app, "POST", &api::assign_agent(OPEN), Some(&body)).await;
@@ -254,14 +264,14 @@ mod tests {
     #[tokio::test]
     async fn unknown_ticket_is_not_found() {
         let (status, error): (_, ErrorDto) =
-            send(&seeded_app(), "POST", &api::close_ticket(99), None).await;
+            send(&seeded_app().await, "POST", &api::close_ticket(99), None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(error.error, "ticket does not exist");
     }
 
     #[tokio::test]
     async fn discount_follows_open_tickets_and_is_idempotent() {
-        let app = seeded_app();
+        let app = seeded_app().await;
         let (status, tenant): (_, TenantDto) =
             send(&app, "POST", &api::apply_discount(ACME), None).await;
         assert_eq!(status, StatusCode::OK);

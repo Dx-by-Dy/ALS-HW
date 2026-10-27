@@ -1,5 +1,5 @@
-use std::cell::Cell;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::domain::time::Timestamp;
@@ -23,17 +23,18 @@ impl Clock for SystemClock {
 
 /// Часы, которые двигает вызывающий код. Клоны делят одно время:
 /// один клон отдаём сервису, другим управляем в демо и тестах.
+/// Время атомарное, поэтому сервис с такими часами можно отдать в другую задачу.
 #[derive(Debug, Clone, Default)]
-pub struct ManualClock(Rc<Cell<Timestamp>>);
+pub struct ManualClock(Arc<AtomicU64>);
 
 impl ManualClock {
     pub fn advance(&self, secs: u64) {
-        self.0.set(Timestamp(self.0.get().0 + secs));
+        self.0.fetch_add(secs, Ordering::Relaxed);
     }
 }
 
 impl Clock for ManualClock {
     fn now(&self) -> Timestamp {
-        self.0.get()
+        Timestamp(self.0.load(Ordering::Relaxed))
     }
 }

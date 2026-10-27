@@ -20,15 +20,23 @@ impl<A> Default for InMemorySnapshotStore<A> {
     }
 }
 
-impl<A: Clone> SnapshotStore<A> for InMemorySnapshotStore<A> {
+impl<A: Clone + Send + Sync> SnapshotStore<A> for InMemorySnapshotStore<A> {
     type Error = StorageError;
 
-    fn save_snapshot(&mut self, id: StreamId, pos: EventPos, state: A) -> Result<(), Self::Error> {
+    async fn save_snapshot(
+        &mut self,
+        id: StreamId,
+        pos: EventPos,
+        state: A,
+    ) -> Result<(), Self::Error> {
         self.snapshots.insert(id, (state, pos));
         Ok(())
     }
 
-    fn load_latest_snapshot(&self, id: StreamId) -> Result<Option<(A, EventPos)>, Self::Error> {
+    async fn load_latest_snapshot(
+        &self,
+        id: StreamId,
+    ) -> Result<Option<(A, EventPos)>, Self::Error> {
         Ok(self.snapshots.get(&id).cloned())
     }
 }

@@ -12,21 +12,27 @@ pub struct StreamId(pub usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct EventPos(pub usize);
 
+/// Хранилище событий. Методы асинхронные: настоящее хранилище ходит в сеть или на диск,
+/// а возвращаемые future — `Send`, чтобы с хранилищем можно было работать из задачи tokio.
 pub trait EventStore<E> {
     type Error;
 
     /// События стрима с индексами `pos..`, в порядке записи.
     ///
     /// Для несуществующего стрима или `pos`, равной текущей длине стрима,
-    /// возвращает пустой итератор.
+    /// возвращает пустой вектор.
     fn event_stream_from_pos(
         &self,
         stream_id: StreamId,
         pos: EventPos,
-    ) -> Result<impl IntoIterator<Item = E>, Self::Error>;
+    ) -> impl Future<Output = Result<Vec<E>, Self::Error>> + Send;
 
     /// Дописывает событие в конец стрима и возвращает новую позицию,
     /// то есть длину стрима вместе с этим событием.
     /// Первое событие в стриме вернёт `EventPos(1)`.
-    fn store_event(&mut self, stream_id: StreamId, event: E) -> Result<EventPos, Self::Error>;
+    fn store_event(
+        &mut self,
+        stream_id: StreamId,
+        event: E,
+    ) -> impl Future<Output = Result<EventPos, Self::Error>> + Send;
 }
