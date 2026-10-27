@@ -1,6 +1,10 @@
-use crate::event_sourcing::event_store::{EventPos, StreamId};
+use super::event_store::{EventPos, StreamId};
 
-/// Хранилище снапшотов. Асинхронное по тем же причинам, что и [`EventStore`](crate::event_sourcing::event_store::EventStore).
+/// Хранилище снапшотов — сохранённых состояний агрегата на некоторой позиции стрима.
+///
+/// Снапшот лишь ускоряет восстановление: состояние из снапшота плюс события после него
+/// должно совпадать с полной свёрткой стрима. Асинхронное по тем же причинам,
+/// что и [`EventStore`](super::event_store::EventStore).
 pub trait SnapshotStore<A> {
     type Error;
 
@@ -13,6 +17,7 @@ pub trait SnapshotStore<A> {
         state: A,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
+    /// Последний сохранённый снапшот стрима; `None`, если снапшотов ещё не было.
     fn load_latest_snapshot(
         &self,
         id: StreamId,

@@ -3,16 +3,18 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 
-use crate::event_sourcing::{
+use super::{
     event_sourced::EventSourced,
     event_store::{EventPos, EventStore, StreamId},
     snapshot_store::SnapshotStore,
 };
 
+/// Ошибка выполнения команды через репозиторий.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepositoryError<D, S> {
     /// Агрегат отклонил команду.
     Domain(D),
+    /// Не удалось прочитать или записать хранилище.
     Storage(S),
 }
 

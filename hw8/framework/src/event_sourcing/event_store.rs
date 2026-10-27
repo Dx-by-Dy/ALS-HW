@@ -1,3 +1,4 @@
+/// Идентификатор стрима — у каждого экземпляра агрегата свой стрим событий.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct StreamId(pub usize);
 
@@ -12,8 +13,10 @@ pub struct StreamId(pub usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct EventPos(pub usize);
 
-/// Хранилище событий. Методы асинхронные: настоящее хранилище ходит в сеть или на диск,
-/// а возвращаемые future — `Send`, чтобы с хранилищем можно было работать из задачи tokio.
+/// Хранилище событий: append-only стримы, из которых восстанавливаются агрегаты.
+///
+/// Методы асинхронные: настоящее хранилище ходит в сеть или на диск, а возвращаемые
+/// future — `Send`, чтобы с хранилищем можно было работать из задачи tokio.
 pub trait EventStore<E> {
     type Error;
 

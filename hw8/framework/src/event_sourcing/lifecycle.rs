@@ -1,6 +1,4 @@
-use crate::event_sourcing::{
-    aggregate::Aggregate, command_handler::CommandHandler, event_handler::EventHandler,
-};
+use super::{aggregate::Aggregate, command_handler::CommandHandler, event_handler::EventHandler};
 
 /// Агрегат, которого может ещё не быть: состояние пустого стрима — `None`.
 ///
