@@ -5,7 +5,8 @@
 //! Чтение: [`Projection`](projection::Projection) строит read-модель из потока событий
 //! [`EventSource`](event_source::EventSource), а [`QueryHandler`](query::QueryHandler) отвечает
 //! на [`Query`](query::Query) по этой модели. Реакции на события, которые порождают новые
-//! команды, описывает [`Policy`](policy::Policy).
+//! команды, описывает [`Policy`](policy::Policy). Фоновые циклы, которые соединяют
+//! источник событий с проекциями и политиками, — в [`runner`].
 
 pub mod command_bus;
 pub mod envelope;
@@ -13,3 +14,4 @@ pub mod event_source;
 pub mod policy;
 pub mod projection;
 pub mod query;
+pub mod runner;

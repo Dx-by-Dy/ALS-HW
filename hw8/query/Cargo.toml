@@ -1,0 +1,13 @@
+[package]
+name = "query"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+framework = { path = "../framework" }
+ticketing = { path = "../ticketing" }
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+command = { path = "../command" }
+tokio = { version = "1", features = ["macros", "rt"] }
