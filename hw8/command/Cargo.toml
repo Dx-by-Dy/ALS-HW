@@ -1,0 +1,11 @@
+[package]
+name = "command"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ticketing = { path = "../ticketing" }
+tokio = { version = "1", features = ["rt", "sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

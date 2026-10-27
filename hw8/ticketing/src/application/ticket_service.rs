@@ -12,6 +12,7 @@ use super::{
 };
 use crate::core::aggregate::Aggregate;
 use crate::domain::{
+    DomainEvent,
     tenant::{Tenant, TenantCommand, TenantEvent, TenantId},
     ticket::{CloseReason, Ticket, TicketCommand, TicketEvent, TicketId},
     user::{User, UserCommand, UserEvent, UserId},
@@ -40,12 +41,17 @@ where
 /// Сервис приложения: принимает внешние команды, достраивает их до команд агрегатов
 /// (идентификаторы, время, данные других агрегатов) и выполняет через репозитории.
 /// Каждый метод возвращает событие, которое было записано в стрим.
+///
+/// Кроме того, каждое записанное событие попадает в outbox, откуда его забирает
+/// [`take_outbox`](Self::take_outbox) для публикации. Outbox пополняется сразу после записи
+/// в стрим, поэтому не теряет событий, даже если команда, записав часть из них, вернула ошибку.
 pub struct TicketService<C> {
     clock: C,
     tickets: InMemoryRepository<Option<Ticket>>,
     tenants: InMemoryRepository<Option<Tenant>>,
     users: InMemoryRepository<Option<User>>,
     open_tickets: OpenTickets,
+    outbox: Vec<DomainEvent>,
     next_ticket_id: usize,
     next_tenant_id: usize,
     next_user_id: usize,
@@ -59,6 +65,7 @@ impl<C: Clock> TicketService<C> {
             tenants: in_memory_repository(),
             users: in_memory_repository(),
             open_tickets: OpenTickets::default(),
+            outbox: Vec::new(),
             next_ticket_id: 1,
             next_tenant_id: 1,
             next_user_id: 1,
@@ -76,6 +83,7 @@ impl<C: Clock> TicketService<C> {
         };
         let event = self.tenants.execute(tenant_id.into(), &command).await?;
         self.next_tenant_id += 1;
+        self.outbox.push(event.clone().into());
         Ok(event)
     }
 
@@ -91,6 +99,7 @@ impl<C: Clock> TicketService<C> {
         };
         let event = self.users.execute(user_id.into(), &command).await?;
         self.next_user_id += 1;
+        self.outbox.push(event.clone().into());
         Ok(event)
     }
 
@@ -169,10 +178,12 @@ impl<C: Clock> TicketService<C> {
     ) -> Result<TenantEvent, ServiceError> {
         let open_tickets = self.open_tickets.count_for_tenant(command.tenant_id);
         let command_for_tenant = TenantCommand::ApplyDiscount { open_tickets };
-        Ok(self
+        let event = self
             .tenants
             .execute(command.tenant_id.into(), &command_for_tenant)
-            .await?)
+            .await?;
+        self.outbox.push(event.clone().into());
+        Ok(event)
     }
 
     pub async fn ticket(&self, ticket_id: TicketId) -> Result<Option<Ticket>, ServiceError> {
@@ -218,6 +229,11 @@ impl<C: Clock> TicketService<C> {
         self.open_tickets.count_for_tenant(tenant_id)
     }
 
+    /// Забирает события, записанные с прошлого вызова, в порядке записи.
+    pub fn take_outbox(&mut self) -> Vec<DomainEvent> {
+        std::mem::take(&mut self.outbox)
+    }
+
     async fn execute_ticket(
         &mut self,
         ticket_id: TicketId,
@@ -225,6 +241,7 @@ impl<C: Clock> TicketService<C> {
     ) -> Result<TicketEvent, ServiceError> {
         let event = self.tickets.execute(ticket_id.into(), &command).await?;
         self.open_tickets.project(&event);
+        self.outbox.push(event.clone().into());
         Ok(event)
     }
 }
@@ -647,6 +664,47 @@ mod tests {
         assert!(matches!(
             f.apply_discount().await,
             Err(ServiceError::Tenant(TenantError::DiscountUnchanged(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn outbox_collects_stored_events_in_order() {
+        let mut f = fixture().await;
+        f.service.take_outbox();
+        let ticket_id = f.create_ticket().await;
+        f.assign(ticket_id, f.customer_id).await.unwrap_err();
+        f.assign(ticket_id, f.agent_id).await.unwrap();
+
+        let outbox = f.service.take_outbox();
+        assert!(matches!(
+            outbox.as_slice(),
+            [
+                DomainEvent::Ticket(TicketEvent::Created(_)),
+                DomainEvent::Ticket(TicketEvent::AgentAssigned(_)),
+            ]
+        ));
+        assert!(f.service.take_outbox().is_empty());
+    }
+
+    #[tokio::test]
+    async fn outbox_has_registrations_and_discount() {
+        let mut f = fixture().await;
+        for _ in 0..=DiscountRate::THRESHOLD {
+            f.create_ticket().await;
+        }
+        f.apply_discount().await.unwrap();
+        let outbox = f.service.take_outbox();
+        assert!(matches!(
+            outbox[0],
+            DomainEvent::Tenant(TenantEvent::Registered(_))
+        ));
+        assert!(matches!(
+            outbox[1],
+            DomainEvent::User(UserEvent::Registered(_))
+        ));
+        assert!(matches!(
+            outbox.last(),
+            Some(DomainEvent::Tenant(TenantEvent::DiscountApplied(_)))
         ));
     }
 
