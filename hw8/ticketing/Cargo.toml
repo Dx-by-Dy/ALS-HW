@@ -1,0 +1,6 @@
+[package]
+name = "ticketing"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
