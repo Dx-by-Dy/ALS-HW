@@ -94,9 +94,10 @@ mod tests {
         })
     }
 
-    fn closed(ticket: usize) -> TicketEvent {
+    fn closed(ticket: usize, tenant: usize) -> TicketEvent {
         TicketEvent::Closed(TicketClosedEvent {
             ticket_id: TicketId(ticket),
+            tenant_id: TenantId(tenant),
             reason: CloseReason::Resolved,
             at: Timestamp(0),
         })
@@ -109,7 +110,7 @@ mod tests {
             created(1, 1, 0),
             created(2, 1, 0),
             created(3, 2, 0),
-            closed(1),
+            closed(1, 1),
         ] {
             view.project(&event);
         }
@@ -143,7 +144,7 @@ mod tests {
     fn reopened_ticket_counts_again_with_fresh_activity() {
         let mut view = OpenTickets::default();
         view.project(&created(1, 1, 0));
-        view.project(&closed(1));
+        view.project(&closed(1, 1));
         view.project(&TicketEvent::Reopened(TicketReopenedEvent {
             ticket_id: TicketId(1),
             tenant_id: TenantId(1),
@@ -164,7 +165,7 @@ mod tests {
     fn closed_tickets_are_never_inactive() {
         let mut view = OpenTickets::default();
         view.project(&created(1, 1, 0));
-        view.project(&closed(1));
+        view.project(&closed(1, 1));
         assert!(view.inactive_at(Timestamp(u64::MAX)).is_empty());
     }
 }

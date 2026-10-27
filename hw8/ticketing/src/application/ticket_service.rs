@@ -445,6 +445,7 @@ mod tests {
             f.service.handle_close_ticket(command).await,
             Ok(TicketEvent::Closed(TicketClosedEvent {
                 ticket_id,
+                tenant_id: f.tenant_id,
                 reason: CloseReason::Resolved,
                 at: Timestamp(0)
             }))
@@ -550,6 +551,7 @@ mod tests {
             f.service.close_inactive_tickets().await,
             Ok(vec![TicketEvent::Closed(TicketClosedEvent {
                 ticket_id: stale,
+                tenant_id: f.tenant_id,
                 reason: CloseReason::Inactivity,
                 at: Timestamp(INACTIVITY_TIMEOUT_SECS),
             })])

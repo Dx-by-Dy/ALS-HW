@@ -1,10 +1,17 @@
 //! Асинхронный конвейер целиком: команды идут в актор командной стороны, проекция
-//! в отдельной задаче получает события и обновляет read-модель.
+//! в отдельной задаче получает события и обновляет read-модель, политика скидок
+//! в другой задаче отвечает на события новыми командами.
 
-use command::{Command, CommandActorHandle};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use command::{Command, CommandActorHandle, CommandError};
 use framework::cqrs::{
-    command_bus::CommandBus, envelope::Version, projection::Projection, query::QueryHandler,
-    runner::run_projection,
+    command_bus::CommandBus,
+    envelope::Version,
+    projection::Projection,
+    query::QueryHandler,
+    runner::{run_policy, run_projection},
 };
 use query::{
     ReadModel,
@@ -16,13 +23,15 @@ use ticketing::application::{
     clock::ManualClock,
     commands::{
         AssignAgentCommand, CloseTicketCommand, CreateTicketCommand, RegisterTenantCommand,
-        RegisterUserCommand,
+        RegisterUserCommand, ReopenTicketCommand,
     },
+    discount_policy::DiscountPolicy,
+    error::ServiceError,
     ticket_service::TicketService,
 };
 use ticketing::domain::{
     DomainEvent,
-    tenant::TenantId,
+    tenant::{DiscountRate, TenantError, TenantId},
     ticket::{CloseReason, INACTIVITY_TIMEOUT_SECS, TicketId, TicketStatus},
     time::Timestamp,
     user::{Role, UserId},
@@ -118,4 +127,69 @@ async fn closing_inactive_tickets_reaches_read_model() {
     assert_eq!(closed.len(), 2);
     let Ok(acme) = model.handle(GetTenant(ACME)).await;
     assert_eq!(acme.unwrap().open_tickets, 0);
+}
+
+/// Запускает политику скидок; все отказы, кроме «скидка не изменилась», копит для проверки.
+fn start_discount_policy(bus: &CommandActorHandle) -> Arc<Mutex<Vec<CommandError>>> {
+    let unexpected = Arc::new(Mutex::new(Vec::new()));
+    let (bus, errors) = (bus.clone(), unexpected.clone());
+    tokio::spawn(async move {
+        run_policy::<DomainEvent, _, _, _>(&bus, Version(0), &DiscountPolicy, &bus, |e| {
+            if !matches!(
+                e,
+                CommandError::Rejected(ServiceError::Tenant(TenantError::DiscountUnchanged(_)))
+            ) {
+                errors.lock().unwrap().push(e);
+            }
+        })
+        .await
+    });
+    unexpected
+}
+
+/// Ждёт, пока скидка Acme в read-модели станет `expected`.
+async fn discount_becomes(model: &ReadModel, expected: DiscountRate) {
+    let wait = async {
+        loop {
+            let version = model.version().await;
+            let Ok(acme) = model.handle(GetTenant(ACME)).await;
+            if acme.is_some_and(|t| t.discount_rate == expected) {
+                return;
+            }
+            model.wait_until(version.next()).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), wait)
+        .await
+        .unwrap_or_else(|_| panic!("discount did not become {expected}"));
+}
+
+#[tokio::test]
+async fn discount_policy_follows_open_tickets() {
+    let bus = command::spawn(TicketService::new(ManualClock::default()));
+    let model = start_projection(&bus);
+    let unexpected = start_discount_policy(&bus);
+    acme_with_alice(&bus).await;
+
+    for _ in 0..=DiscountRate::THRESHOLD {
+        create_ticket(&bus).await;
+    }
+    discount_becomes(&model, DiscountRate::STANDARD).await;
+
+    let close = CloseTicketCommand {
+        ticket_id: TicketId(1),
+        reason: CloseReason::Resolved,
+    };
+    send(&bus, close).await;
+    discount_becomes(&model, DiscountRate::NONE).await;
+
+    send(
+        &bus,
+        ReopenTicketCommand {
+            ticket_id: TicketId(1),
+        },
+    )
+    .await;
+    discount_becomes(&model, DiscountRate::STANDARD).await;
+    assert!(unexpected.lock().unwrap().is_empty());
 }

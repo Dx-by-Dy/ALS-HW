@@ -106,6 +106,7 @@ impl Ticket {
         }
         Ok(TicketEvent::Closed(TicketClosedEvent {
             ticket_id: self.ticket_id,
+            tenant_id: self.tenant,
             reason,
             at,
         }))
@@ -520,6 +521,7 @@ mod tests {
             open_ticket().decide(&command),
             Ok(TicketEvent::Closed(TicketClosedEvent {
                 ticket_id: TicketId(1),
+                tenant_id: TenantId(1),
                 reason: CloseReason::Inactivity,
                 at,
             }))
@@ -602,6 +604,7 @@ mod tests {
     fn event_before_creation_means_corrupted_stream() {
         let event = TicketEvent::Closed(TicketClosedEvent {
             ticket_id: TicketId(1),
+            tenant_id: TenantId(1),
             reason: CloseReason::Resolved,
             at: T0,
         });

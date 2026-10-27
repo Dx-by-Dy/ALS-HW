@@ -143,7 +143,7 @@ mod tests {
             created(1, ACME, 0),
             created(2, ACME, 0),
             assigned(1, ALICE, None),
-            closed(2, 100),
+            closed(2, ACME, 100),
         ])
         .await;
         assert_eq!(model.version().await, Version(6));
@@ -169,7 +169,7 @@ mod tests {
         let model = model_with(vec![tenant(ACME, "Acme")]).await;
         let orphan = Envelope {
             version: Version(2),
-            event: closed(9, 0),
+            event: closed(9, ACME, 0),
         };
         assert_eq!(
             model.project(&orphan).await,

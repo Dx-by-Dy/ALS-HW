@@ -420,9 +420,10 @@ pub(crate) mod tests {
         .into()
     }
 
-    pub fn closed(ticket: usize, at: u64) -> DomainEvent {
+    pub fn closed(ticket: usize, tenant_id: TenantId, at: u64) -> DomainEvent {
         TicketEvent::Closed(TicketClosedEvent {
             ticket_id: TicketId(ticket),
+            tenant_id,
             reason: CloseReason::Resolved,
             at: Timestamp(at),
         })
@@ -543,7 +544,11 @@ pub(crate) mod tests {
 
     #[test]
     fn closing_records_time_and_frees_agent_and_tenant() {
-        let state = with([created(1, ACME, 0), assigned(1, ALICE, None), closed(1, 50)]);
+        let state = with([
+            created(1, ACME, 0),
+            assigned(1, ALICE, None),
+            closed(1, ACME, 50),
+        ]);
         let ticket = state.ticket(TicketId(1)).unwrap();
         assert_eq!(ticket.status, TicketStatus::Closed);
         assert_eq!(ticket.closed_at, Some(Timestamp(50)));
@@ -557,7 +562,7 @@ pub(crate) mod tests {
         let state = with([
             created(1, ACME, 0),
             assigned(1, ALICE, None),
-            closed(1, 50),
+            closed(1, ACME, 50),
             reopened(1, ACME),
         ]);
         let ticket = state.ticket(TicketId(1)).unwrap();
@@ -585,7 +590,7 @@ pub(crate) mod tests {
             assigned(1, ALICE, None),
             assigned(2, ALICE, None),
             assigned(3, CAROL, None),
-            closed(2, 0),
+            closed(2, GLOBEX, 0),
         ]);
         assert_eq!(ids(&state.active_tickets_of_agent(ALICE)), [1]);
         assert_eq!(ids(&state.active_tickets_of_agent(CAROL)), [3]);
@@ -600,7 +605,7 @@ pub(crate) mod tests {
             created(3, ACME, 0),
             created(4, GLOBEX, 0),
             assigned(2, ALICE, None),
-            closed(3, 0),
+            closed(3, ACME, 0),
         ]);
         assert_eq!(ids(&state.unassigned_tickets_of_tenant(ACME)), [1]);
         assert_eq!(ids(&state.unassigned_tickets_of_tenant(GLOBEX)), [4]);
@@ -612,9 +617,9 @@ pub(crate) mod tests {
             created(1, ACME, 0),
             created(2, ACME, 0),
             created(3, ACME, 0),
-            closed(1, 300),
-            closed(2, 100),
-            closed(3, 200),
+            closed(1, ACME, 300),
+            closed(2, ACME, 100),
+            closed(3, ACME, 200),
         ]);
         assert_eq!(ids(&state.tickets_closed_since(Timestamp(200))), [3, 1]);
         assert_eq!(ids(&state.tickets_closed_since(Timestamp(0))), [2, 3, 1]);
@@ -627,7 +632,7 @@ pub(crate) mod tests {
             created(1, ACME, 0),
             created(2, GLOBEX, 0),
             created(3, ACME, 0),
-            closed(3, 0),
+            closed(3, ACME, 0),
         ]);
         assert_eq!(ids(&state.tickets(ListTickets::default())), [1, 2, 3]);
         let acme = ListTickets {
@@ -644,7 +649,7 @@ pub(crate) mod tests {
 
     #[test]
     fn changes_since_return_each_record_once_in_latest_state() {
-        let state = with([created(1, ACME, 0), created(2, ACME, 0), closed(1, 0)]);
+        let state = with([created(1, ACME, 0), created(2, ACME, 0), closed(1, ACME, 0)]);
         // v5: тикет 1 (и Acme), v6: тикет 2 (и Acme), v7: тикет 1 закрыт (и Acme).
         let changes = state.changes_since(Version(5));
         assert_eq!(changes.version, Version(7));
@@ -705,7 +710,7 @@ pub(crate) mod tests {
         let mut state = with([]);
         let orphan = Envelope {
             version: Version(5),
-            event: closed(9, 0),
+            event: closed(9, ACME, 0),
         };
         assert_eq!(
             state.apply(&orphan),

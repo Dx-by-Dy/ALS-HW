@@ -32,6 +32,8 @@ pub struct AgentAssignedEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketClosedEvent {
     pub ticket_id: TicketId,
+    /// Нужен тем, кто следит за тикетами тенанта: проекциям и политике скидок.
+    pub tenant_id: TenantId,
     pub reason: CloseReason,
     pub at: Timestamp,
 }
@@ -39,7 +41,7 @@ pub struct TicketClosedEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketReopenedEvent {
     pub ticket_id: TicketId,
-    /// Нужен проекции открытых тикетов: событие закрытия убирает тикет из неё целиком.
+    /// Нужен тем, кто следит за тикетами тенанта: проекциям и политике скидок.
     pub tenant_id: TenantId,
     pub at: Timestamp,
 }
