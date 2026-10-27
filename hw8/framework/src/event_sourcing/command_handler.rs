@@ -1,4 +1,4 @@
-use crate::core::aggregate::Aggregate;
+use crate::event_sourcing::aggregate::Aggregate;
 
 pub trait CommandHandler: Aggregate {
     type Error;

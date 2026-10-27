@@ -1,13 +1,12 @@
 use std::error::Error;
 use std::fmt;
 
-use super::repository::RepositoryError;
 use crate::domain::{
     tenant::{TenantError, TenantId},
     ticket::TicketError,
     user::{UserError, UserId},
 };
-use crate::infrastructure::error::StorageError;
+use framework::{event_sourcing::repository::RepositoryError, in_memory::error::StorageError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceError {

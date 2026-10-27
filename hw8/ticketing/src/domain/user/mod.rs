@@ -8,10 +8,7 @@ pub use command::UserCommand;
 pub use error::UserError;
 pub use events::{UserEvent, UserRegisteredEvent};
 
-use crate::core::{
-    aggregate::Aggregate, command_handler::CommandHandler, event_handler::EventHandler,
-    event_store::StreamId,
-};
+use framework::event_sourcing::{event_store::StreamId, lifecycle::Lifecycle};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UserId(pub usize);
@@ -90,38 +87,38 @@ impl From<&UserRegisteredEvent> for User {
     }
 }
 
-/// Агрегат — «пользователь, которого может ещё не быть»: `None` соответствует пустому стриму.
-impl Aggregate for Option<User> {
+/// Пользователя может ещё не быть: агрегат — `Option<User>`, где `None` соответствует пустому стриму.
+impl Lifecycle for User {
     type Event = UserEvent;
     type Command = UserCommand;
-}
-
-impl CommandHandler for Option<User> {
     type Error = UserError;
 
-    fn decide(&self, command: &UserCommand) -> Result<UserEvent, UserError> {
-        match (self, command) {
-            (
-                None,
-                UserCommand::Register {
-                    user_id,
-                    user_name,
-                    role,
-                },
-            ) => User::register(*user_id, user_name, *role),
-            (Some(user), UserCommand::Register { .. }) => {
-                Err(UserError::AlreadyExists(user.user_id))
-            }
+    fn decide_new(command: &UserCommand) -> Result<UserEvent, UserError> {
+        match command {
+            UserCommand::Register {
+                user_id,
+                user_name,
+                role,
+            } => User::register(*user_id, user_name, *role),
         }
     }
-}
 
-impl EventHandler for Option<User> {
-    fn apply_event(self, event: &UserEvent) -> Self {
-        match (self, event) {
-            (None, UserEvent::Registered(registered)) => Some(User::from(registered)),
-            (Some(user), UserEvent::Registered(_)) => {
-                panic!("corrupted stream: {} registered twice", user.user_id)
+    fn decide(&self, command: &UserCommand) -> Result<UserEvent, UserError> {
+        match command {
+            UserCommand::Register { .. } => Err(UserError::AlreadyExists(self.user_id)),
+        }
+    }
+
+    fn created(event: &UserEvent) -> Self {
+        match event {
+            UserEvent::Registered(registered) => User::from(registered),
+        }
+    }
+
+    fn evolve(self, event: &UserEvent) -> Self {
+        match event {
+            UserEvent::Registered(_) => {
+                panic!("corrupted stream: {} registered twice", self.user_id)
             }
         }
     }
@@ -130,7 +127,7 @@ impl EventHandler for Option<User> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::event_sourced::EventSourced;
+    use framework::event_sourcing::{command_handler::CommandHandler, event_sourced::EventSourced};
 
     fn register(name: &str, role: Role) -> UserCommand {
         UserCommand::Register {

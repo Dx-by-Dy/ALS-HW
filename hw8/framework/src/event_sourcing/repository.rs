@@ -3,7 +3,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 
-use crate::core::{
+use crate::event_sourcing::{
     event_sourced::EventSourced,
     event_store::{EventPos, EventStore, StreamId},
     snapshot_store::SnapshotStore,
@@ -93,12 +93,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{
+    use crate::event_sourcing::{
         aggregate::Aggregate, command_handler::CommandHandler, event_handler::EventHandler,
     };
-    use crate::infrastructure::{
-        error::StorageError, in_memory_event_store::InMemoryEventStore,
-        in_memory_snapshot_store::InMemorySnapshotStore,
+    use crate::in_memory::{
+        error::StorageError, event_store::InMemoryEventStore, snapshot_store::InMemorySnapshotStore,
     };
 
     /// Простейший агрегат: счётчик, который не может уйти в минус.

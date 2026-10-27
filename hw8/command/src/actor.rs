@@ -1,17 +1,17 @@
+use framework::cqrs::envelope::{Committed, Envelope, Version};
 use ticketing::application::{clock::Clock, error::ServiceError, ticket_service::TicketService};
-use ticketing::core::envelope::{Envelope, Version};
 use ticketing::domain::DomainEvent;
 use tokio::sync::mpsc;
 
-use crate::bus::{CommandBus, Committed, EventReceiver, Message};
 use crate::command::Command;
+use crate::handle::{CommandActorHandle, EventSubscription, Message};
 
 /// Сколько команд может ждать в очереди, прежде чем отправители начнут ждать места.
 const INBOX_CAPACITY: usize = 64;
 
 /// Запускает актор в задаче tokio и возвращает ручку к нему.
-/// Актор останавливается, когда пропадает последний клон [`CommandBus`].
-pub fn spawn<C>(service: TicketService<C>) -> CommandBus
+/// Актор останавливается, когда пропадает последний клон [`CommandActorHandle`].
+pub fn spawn<C>(service: TicketService<C>) -> CommandActorHandle
 where
     C: Clock + Send + Sync + 'static,
 {
@@ -23,7 +23,7 @@ where
         subscribers: Vec::new(),
     };
     tokio::spawn(actor.run());
-    CommandBus::new(sender)
+    CommandActorHandle::new(sender)
 }
 
 /// Единственный писатель: команды выполняются по одной, поэтому между проверкой
@@ -52,7 +52,7 @@ impl<C: Clock> CommandActor<C> {
         }
     }
 
-    async fn execute(&mut self, command: Command) -> Result<Committed, ServiceError> {
+    async fn execute(&mut self, command: Command) -> Result<Committed<DomainEvent>, ServiceError> {
         let result = self.dispatch(command).await;
         // Публикуем и при ошибке: команда могла успеть записать часть событий.
         let events = self.publish_outbox();
@@ -93,7 +93,7 @@ impl<C: Clock> CommandActor<C> {
         published
     }
 
-    fn subscribe(&mut self, after: Version) -> EventReceiver {
+    fn subscribe(&mut self, after: Version) -> EventSubscription {
         let (sender, receiver) = mpsc::unbounded_channel();
         let history = usize::try_from(after.0).unwrap_or(usize::MAX);
         for envelope in self.journal.iter().skip(history) {
@@ -101,7 +101,7 @@ impl<C: Clock> CommandActor<C> {
             let _ = sender.send(envelope.clone());
         }
         self.subscribers.push(sender);
-        receiver
+        EventSubscription(receiver)
     }
 
     fn version(&self) -> Version {
@@ -113,6 +113,10 @@ impl<C: Clock> CommandActor<C> {
 mod tests {
     use super::*;
     use crate::CommandError;
+    use framework::cqrs::{
+        command_bus::CommandBus,
+        event_source::{EventSource, Subscription},
+    };
     use ticketing::application::{
         clock::ManualClock,
         commands::{
@@ -126,7 +130,7 @@ mod tests {
         user::{Role, UserId},
     };
 
-    fn versions(committed: &Committed) -> Vec<u64> {
+    fn versions(committed: &Committed<DomainEvent>) -> Vec<u64> {
         committed.events.iter().map(|e| e.version.0).collect()
     }
 
@@ -135,7 +139,7 @@ mod tests {
     }
 
     /// Актор с тенантом `TenantId(1)` (версия 1) и агентом `UserId(1)` (версия 2).
-    async fn bus_with_tenant() -> (CommandBus, ManualClock) {
+    async fn bus_with_tenant() -> (CommandActorHandle, ManualClock) {
         let clock = ManualClock::default();
         let bus = spawn(TicketService::new(clock.clone()));
         bus.send(RegisterTenantCommand::new("Acme")).await.unwrap();
@@ -208,8 +212,8 @@ mod tests {
     async fn subscriber_gets_history_after_version_then_live_events() {
         let (bus, _) = bus_with_tenant().await;
         let mut events = bus.subscribe(Version(1)).await.unwrap();
-        assert_eq!(events.recv().await.unwrap().version, Version(2));
-        assert!(events.try_recv().is_err());
+        assert_eq!(events.next().await.unwrap().version, Version(2));
+        assert_eq!(events.try_next(), None);
 
         bus.send(ticket(TenantId(1))).await.unwrap();
         bus.send(CloseTicketCommand {
@@ -218,7 +222,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let live: Vec<_> = [events.recv().await, events.recv().await]
+        let live: Vec<_> = [events.next().await, events.next().await]
             .into_iter()
             .map(|e| e.unwrap().version)
             .collect();
@@ -229,9 +233,9 @@ mod tests {
     async fn subscriber_after_last_version_gets_only_new_events() {
         let (bus, _) = bus_with_tenant().await;
         let mut events = bus.subscribe(Version(100)).await.unwrap();
-        assert!(events.try_recv().is_err());
+        assert_eq!(events.try_next(), None);
         bus.send(ticket(TenantId(1))).await.unwrap();
-        assert_eq!(events.recv().await.unwrap().version, Version(3));
+        assert_eq!(events.next().await.unwrap().version, Version(3));
     }
 
     #[tokio::test]
@@ -243,7 +247,7 @@ mod tests {
             agent_id: UserId(1),
         };
         assert!(bus.send(assign_missing_ticket).await.is_err());
-        assert!(events.try_recv().is_err());
+        assert_eq!(events.try_next(), None);
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use super::error::StorageError;
-use crate::core::{
+use crate::event_sourcing::{
     event_store::{EventPos, StreamId},
     snapshot_store::SnapshotStore,
 };

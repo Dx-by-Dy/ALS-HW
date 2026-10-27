@@ -235,6 +235,7 @@ checksum = "2550f75b8cfac212855f6b1885455df8eaee8fe8e246b647d69146142e016084"
 name = "command"
 version = "0.1.0"
 dependencies = [
+ "framework",
  "ticketing",
  "tokio",
 ]
@@ -434,6 +435,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "framework"
+version = "0.1.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]
@@ -1711,6 +1719,7 @@ dependencies = [
 name = "ticketing"
 version = "0.1.0"
 dependencies = [
+ "framework",
  "tokio",
 ]
 

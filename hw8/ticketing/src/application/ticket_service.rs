@@ -8,17 +8,17 @@ use super::{
     },
     error::ServiceError,
     open_tickets::OpenTickets,
-    repository::Repository,
 };
-use crate::core::aggregate::Aggregate;
 use crate::domain::{
     DomainEvent,
     tenant::{Tenant, TenantCommand, TenantEvent, TenantId},
     ticket::{CloseReason, Ticket, TicketCommand, TicketEvent, TicketId},
     user::{User, UserCommand, UserEvent, UserId},
 };
-use crate::infrastructure::{
-    in_memory_event_store::InMemoryEventStore, in_memory_snapshot_store::InMemorySnapshotStore,
+use framework::event_sourcing::aggregate::Aggregate;
+use framework::event_sourcing::repository::Repository;
+use framework::in_memory::{
+    event_store::InMemoryEventStore, snapshot_store::InMemorySnapshotStore,
 };
 
 type InMemoryRepository<A> =
@@ -28,7 +28,7 @@ const SNAPSHOT_EVERY: NonZeroUsize = NonZeroUsize::new(2).unwrap();
 
 fn in_memory_repository<A>() -> InMemoryRepository<A>
 where
-    A: crate::core::event_sourced::EventSourced + Default + Clone + Send + Sync,
+    A: framework::event_sourcing::event_sourced::EventSourced + Default + Clone + Send + Sync,
     A::Event: Clone + Send + Sync,
 {
     Repository::new(

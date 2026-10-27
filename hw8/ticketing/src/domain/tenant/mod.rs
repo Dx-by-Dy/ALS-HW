@@ -10,10 +10,7 @@ pub use discount::DiscountRate;
 pub use error::TenantError;
 pub use events::{DiscountAppliedEvent, TenantEvent, TenantRegisteredEvent};
 
-use crate::core::{
-    aggregate::Aggregate, command_handler::CommandHandler, event_handler::EventHandler,
-    event_store::StreamId,
-};
+use framework::event_sourcing::{event_store::StreamId, lifecycle::Lifecycle};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TenantId(pub usize);
@@ -75,6 +72,47 @@ impl Tenant {
     pub fn discount_rate(&self) -> DiscountRate {
         self.discount_rate
     }
+}
+
+impl From<&TenantRegisteredEvent> for Tenant {
+    fn from(event: &TenantRegisteredEvent) -> Self {
+        Self {
+            tenant_id: event.tenant_id,
+            tenant_name: event.tenant_name.clone(),
+            discount_rate: DiscountRate::NONE,
+        }
+    }
+}
+
+/// Тенанта может ещё не быть: агрегат — `Option<Tenant>`, где `None` соответствует пустому стриму.
+impl Lifecycle for Tenant {
+    type Event = TenantEvent;
+    type Command = TenantCommand;
+    type Error = TenantError;
+
+    fn decide_new(command: &TenantCommand) -> Result<TenantEvent, TenantError> {
+        match command {
+            TenantCommand::Register {
+                tenant_id,
+                tenant_name,
+            } => Tenant::register(*tenant_id, tenant_name),
+            TenantCommand::ApplyDiscount { .. } => Err(TenantError::NotFound),
+        }
+    }
+
+    fn decide(&self, command: &TenantCommand) -> Result<TenantEvent, TenantError> {
+        match command {
+            TenantCommand::Register { .. } => Err(TenantError::AlreadyExists(self.tenant_id)),
+            TenantCommand::ApplyDiscount { open_tickets } => self.apply_discount(*open_tickets),
+        }
+    }
+
+    fn created(event: &TenantEvent) -> Self {
+        match event {
+            TenantEvent::Registered(registered) => Tenant::from(registered),
+            other => panic!("corrupted stream: {other} before registration"),
+        }
+    }
 
     fn evolve(self, event: &TenantEvent) -> Self {
         match event {
@@ -89,59 +127,12 @@ impl Tenant {
     }
 }
 
-impl From<&TenantRegisteredEvent> for Tenant {
-    fn from(event: &TenantRegisteredEvent) -> Self {
-        Self {
-            tenant_id: event.tenant_id,
-            tenant_name: event.tenant_name.clone(),
-            discount_rate: DiscountRate::NONE,
-        }
-    }
-}
-
-/// Агрегат — «тенант, которого может ещё не быть»: `None` соответствует пустому стриму.
-impl Aggregate for Option<Tenant> {
-    type Event = TenantEvent;
-    type Command = TenantCommand;
-}
-
-impl CommandHandler for Option<Tenant> {
-    type Error = TenantError;
-
-    fn decide(&self, command: &TenantCommand) -> Result<TenantEvent, TenantError> {
-        match (self, command) {
-            (
-                None,
-                TenantCommand::Register {
-                    tenant_id,
-                    tenant_name,
-                },
-            ) => Tenant::register(*tenant_id, tenant_name),
-            (Some(tenant), TenantCommand::Register { .. }) => {
-                Err(TenantError::AlreadyExists(tenant.tenant_id))
-            }
-            (None, TenantCommand::ApplyDiscount { .. }) => Err(TenantError::NotFound),
-            (Some(tenant), TenantCommand::ApplyDiscount { open_tickets }) => {
-                tenant.apply_discount(*open_tickets)
-            }
-        }
-    }
-}
-
-impl EventHandler for Option<Tenant> {
-    fn apply_event(self, event: &TenantEvent) -> Self {
-        match (self, event) {
-            (None, TenantEvent::Registered(registered)) => Some(Tenant::from(registered)),
-            (None, other) => panic!("corrupted stream: {other} before registration"),
-            (Some(tenant), event) => Some(tenant.evolve(event)),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::event_sourced::EventSourced;
+    use framework::event_sourcing::{
+        command_handler::CommandHandler, event_handler::EventHandler, event_sourced::EventSourced,
+    };
 
     fn registered() -> Option<Tenant> {
         let command = TenantCommand::Register {

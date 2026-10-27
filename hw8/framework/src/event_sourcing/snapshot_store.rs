@@ -1,6 +1,6 @@
-use crate::core::event_store::{EventPos, StreamId};
+use crate::event_sourcing::event_store::{EventPos, StreamId};
 
-/// Хранилище снапшотов. Асинхронное по тем же причинам, что и [`EventStore`](crate::core::event_store::EventStore).
+/// Хранилище снапшотов. Асинхронное по тем же причинам, что и [`EventStore`](crate::event_sourcing::event_store::EventStore).
 pub trait SnapshotStore<A> {
     type Error;
 

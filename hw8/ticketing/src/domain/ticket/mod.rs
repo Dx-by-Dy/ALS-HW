@@ -12,15 +12,12 @@ pub use events::{
 };
 pub use status::TicketStatus;
 
-use crate::core::{
-    aggregate::Aggregate, command_handler::CommandHandler, event_handler::EventHandler,
-    event_store::StreamId,
-};
 use crate::domain::{
     tenant::TenantId,
     time::Timestamp,
     user::{Role, User, UserId},
 };
+use framework::event_sourcing::{event_store::StreamId, lifecycle::Lifecycle};
 
 /// Сколько тикет может простоять без активности, прежде чем его закроют: 7 дней.
 pub const INACTIVITY_TIMEOUT_SECS: u64 = 7 * 24 * 60 * 60;
@@ -162,6 +159,56 @@ impl Ticket {
             Err(TicketError::Closed(self.ticket_id))
         }
     }
+}
+
+impl From<&TicketCreatedEvent> for Ticket {
+    fn from(event: &TicketCreatedEvent) -> Self {
+        Self {
+            ticket_id: event.ticket_id,
+            category: event.category.clone(),
+            description: event.description.clone(),
+            status: TicketStatus::Open,
+            assigned_agent: None,
+            tenant: event.tenant_id,
+            last_activity: event.at,
+        }
+    }
+}
+
+/// Тикета может ещё не быть: агрегат — `Option<Ticket>`, где `None` соответствует пустому стриму.
+impl Lifecycle for Ticket {
+    type Event = TicketEvent;
+    type Command = TicketCommand;
+    type Error = TicketError;
+
+    fn decide_new(command: &TicketCommand) -> Result<TicketEvent, TicketError> {
+        match command {
+            TicketCommand::Create {
+                ticket_id,
+                category,
+                description,
+                tenant_id,
+                at,
+            } => Ticket::create(*ticket_id, category, description, *tenant_id, *at),
+            _ => Err(TicketError::NotFound),
+        }
+    }
+
+    fn decide(&self, command: &TicketCommand) -> Result<TicketEvent, TicketError> {
+        match command {
+            TicketCommand::Create { .. } => Err(TicketError::AlreadyExists(self.ticket_id)),
+            TicketCommand::AssignAgent { agent, at } => self.assign_agent(agent, *at),
+            TicketCommand::Close { reason, at } => self.close(*reason, *at),
+            TicketCommand::Reopen { at } => self.reopen(*at),
+        }
+    }
+
+    fn created(event: &TicketEvent) -> Self {
+        match event {
+            TicketEvent::Created(created) => Ticket::from(created),
+            other => panic!("corrupted stream: {other} before creation"),
+        }
+    }
 
     fn evolve(self, event: &TicketEvent) -> Self {
         match event {
@@ -188,69 +235,13 @@ impl Ticket {
     }
 }
 
-impl From<&TicketCreatedEvent> for Ticket {
-    fn from(event: &TicketCreatedEvent) -> Self {
-        Self {
-            ticket_id: event.ticket_id,
-            category: event.category.clone(),
-            description: event.description.clone(),
-            status: TicketStatus::Open,
-            assigned_agent: None,
-            tenant: event.tenant_id,
-            last_activity: event.at,
-        }
-    }
-}
-
-/// Агрегат — «тикет, которого может ещё не быть»: `None` соответствует пустому стриму.
-impl Aggregate for Option<Ticket> {
-    type Event = TicketEvent;
-    type Command = TicketCommand;
-}
-
-impl CommandHandler for Option<Ticket> {
-    type Error = TicketError;
-
-    fn decide(&self, command: &TicketCommand) -> Result<TicketEvent, TicketError> {
-        match (self, command) {
-            (
-                None,
-                TicketCommand::Create {
-                    ticket_id,
-                    category,
-                    description,
-                    tenant_id,
-                    at,
-                },
-            ) => Ticket::create(*ticket_id, category, description, *tenant_id, *at),
-            (Some(ticket), TicketCommand::Create { .. }) => {
-                Err(TicketError::AlreadyExists(ticket.ticket_id))
-            }
-            (None, _) => Err(TicketError::NotFound),
-            (Some(ticket), TicketCommand::AssignAgent { agent, at }) => {
-                ticket.assign_agent(agent, *at)
-            }
-            (Some(ticket), TicketCommand::Close { reason, at }) => ticket.close(*reason, *at),
-            (Some(ticket), TicketCommand::Reopen { at }) => ticket.reopen(*at),
-        }
-    }
-}
-
-impl EventHandler for Option<Ticket> {
-    fn apply_event(self, event: &TicketEvent) -> Self {
-        match (self, event) {
-            (None, TicketEvent::Created(created)) => Some(Ticket::from(created)),
-            (None, other) => panic!("corrupted stream: {other} before creation"),
-            (Some(ticket), event) => Some(ticket.evolve(event)),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::event_sourced::EventSourced;
     use crate::domain::user::{UserCommand, UserId};
+    use framework::event_sourcing::{
+        command_handler::CommandHandler, event_handler::EventHandler, event_sourced::EventSourced,
+    };
 
     const T0: Timestamp = Timestamp(1_000);
 

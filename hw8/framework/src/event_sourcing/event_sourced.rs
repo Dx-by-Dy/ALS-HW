@@ -1,4 +1,4 @@
-use crate::core::{command_handler::CommandHandler, event_handler::EventHandler};
+use crate::event_sourcing::{command_handler::CommandHandler, event_handler::EventHandler};
 
 pub trait EventSourced: EventHandler + CommandHandler {
     fn recover(self, stream: impl IntoIterator<Item = Self::Event>) -> Self {

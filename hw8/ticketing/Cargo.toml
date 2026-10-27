@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+framework = { path = "../framework" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }

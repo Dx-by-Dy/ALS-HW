@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-use crate::core::event_store::{EventPos, StreamId};
+use crate::event_sourcing::event_store::{EventPos, StreamId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageError {

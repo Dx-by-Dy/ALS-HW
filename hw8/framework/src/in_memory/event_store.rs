@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use super::error::StorageError;
-use crate::core::event_store::{EventPos, EventStore, StreamId};
+use crate::event_sourcing::event_store::{EventPos, EventStore, StreamId};
 
 /// Стримы событий в памяти процесса: append-only вектор на каждый `StreamId`.
 #[derive(Debug)]
