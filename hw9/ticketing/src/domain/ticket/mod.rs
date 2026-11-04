@@ -5,10 +5,11 @@ mod status;
 
 use std::fmt;
 
-pub use command::{CloseReason, TicketCommand};
+pub use command::{CloseReason, ReminderKind, TicketCommand};
 pub use error::TicketError;
 pub use events::{
-    AgentAssignedEvent, TicketClosedEvent, TicketCreatedEvent, TicketEvent, TicketReopenedEvent,
+    AgentAssignedEvent, ReminderSentEvent, TicketClosedEvent, TicketCreatedEvent, TicketEvent,
+    TicketReopenedEvent,
 };
 pub use status::TicketStatus;
 
@@ -19,8 +20,16 @@ use crate::domain::{
 };
 use framework::event_sourcing::{event_store::StreamId, lifecycle::Lifecycle};
 
-/// Сколько тикет может простоять без активности, прежде чем его закроют: 7 дней.
-pub const INACTIVITY_TIMEOUT_SECS: u64 = 7 * 24 * 60 * 60;
+const DAY_SECS: u64 = 24 * 60 * 60;
+
+/// Сколько тикет может простоять без активности, прежде чем его закроют: 10 дней.
+pub const INACTIVITY_TIMEOUT_SECS: u64 = 10 * DAY_SECS;
+
+/// Когда напомнить о простаивающем тикете: через 3 дня без активности.
+pub const STALE_REMINDER_AFTER_SECS: u64 = 3 * DAY_SECS;
+
+/// Когда предупредить о скором закрытии: за день до истечения таймаута.
+pub const CLOSING_SOON_REMINDER_AFTER_SECS: u64 = INACTIVITY_TIMEOUT_SECS - DAY_SECS;
 
 /// Истёк ли таймаут неактивности к моменту `now`.
 pub fn inactivity_expired(last_activity: Timestamp, now: Timestamp) -> bool {
@@ -52,6 +61,8 @@ pub struct Ticket {
     tenant: TenantId,
     /// Время последнего изменения: от него отсчитывается неактивность.
     last_activity: Timestamp,
+    /// Самое позднее напоминание, отправленное с момента последней активности.
+    last_reminder: Option<ReminderKind>,
 }
 
 impl Ticket {
@@ -107,6 +118,7 @@ impl Ticket {
         Ok(TicketEvent::Closed(TicketClosedEvent {
             ticket_id: self.ticket_id,
             tenant_id: self.tenant,
+            agent_id: self.assigned_agent,
             reason,
             at,
         }))
@@ -121,6 +133,29 @@ impl Ticket {
         Ok(TicketEvent::Reopened(TicketReopenedEvent {
             ticket_id: self.ticket_id,
             tenant_id: self.tenant,
+            at,
+        }))
+    }
+
+    /// Решение о напоминании. Срок и повторы проверяет агрегат: за то время, пока сработавший
+    /// дедлайн дошёл сюда, в тикете могла появиться активность.
+    pub fn send_reminder(
+        &self,
+        kind: ReminderKind,
+        at: Timestamp,
+    ) -> Result<TicketEvent, TicketError> {
+        self.ensure_open()?;
+        let idle_secs = at.secs_since(self.last_activity);
+        if idle_secs < kind.due_after_secs() {
+            return Err(TicketError::ReminderNotDue { kind, idle_secs });
+        }
+        if self.last_reminder >= Some(kind) {
+            return Err(TicketError::ReminderAlreadySent(kind));
+        }
+        Ok(TicketEvent::ReminderSent(ReminderSentEvent {
+            ticket_id: self.ticket_id,
+            agent_id: self.assigned_agent,
+            kind,
             at,
         }))
     }
@@ -172,6 +207,7 @@ impl From<&TicketCreatedEvent> for Ticket {
             assigned_agent: None,
             tenant: event.tenant_id,
             last_activity: event.at,
+            last_reminder: None,
         }
     }
 }
@@ -201,6 +237,7 @@ impl Lifecycle for Ticket {
             TicketCommand::AssignAgent { agent, at } => self.assign_agent(agent, *at),
             TicketCommand::Close { reason, at } => self.close(*reason, *at),
             TicketCommand::Reopen { at } => self.reopen(*at),
+            TicketCommand::SendReminder { kind, at } => self.send_reminder(*kind, *at),
         }
     }
 
@@ -220,6 +257,7 @@ impl Lifecycle for Ticket {
                 status: TicketStatus::InProgress,
                 assigned_agent: Some(e.agent_id),
                 last_activity: e.at,
+                last_reminder: None,
                 ..self
             },
             TicketEvent::Closed(_) => Self {
@@ -230,6 +268,11 @@ impl Lifecycle for Ticket {
                 status: TicketStatus::Open,
                 assigned_agent: None,
                 last_activity: e.at,
+                last_reminder: None,
+                ..self
+            },
+            TicketEvent::ReminderSent(e) => Self {
+                last_reminder: Some(e.kind),
                 ..self
             },
         }
@@ -356,6 +399,11 @@ mod tests {
             at: T0,
         };
         let reopen = TicketCommand::Reopen { at: T0 };
+        let remind = TicketCommand::SendReminder {
+            kind: ReminderKind::Stale,
+            at: T0,
+        };
+        assert_eq!(None::<Ticket>.decide(&remind), Err(TicketError::NotFound));
         assert_eq!(None::<Ticket>.decide(&assign), Err(TicketError::NotFound));
         assert_eq!(None::<Ticket>.decide(&close), Err(TicketError::NotFound));
         assert_eq!(None::<Ticket>.decide(&reopen), Err(TicketError::NotFound));
@@ -522,6 +570,7 @@ mod tests {
             Ok(TicketEvent::Closed(TicketClosedEvent {
                 ticket_id: TicketId(1),
                 tenant_id: TenantId(1),
+                agent_id: None,
                 reason: CloseReason::Inactivity,
                 at,
             }))
@@ -605,9 +654,202 @@ mod tests {
         let event = TicketEvent::Closed(TicketClosedEvent {
             ticket_id: TicketId(1),
             tenant_id: TenantId(1),
+            agent_id: None,
             reason: CloseReason::Resolved,
             at: T0,
         });
         let _ = None::<Ticket>.apply_event(&event);
+    }
+
+    /// Момент через `secs` секунд после создания тикета.
+    fn after(secs: u64) -> Timestamp {
+        Timestamp(T0.0 + secs)
+    }
+
+    fn remind(kind: ReminderKind, at: Timestamp) -> TicketCommand {
+        TicketCommand::SendReminder { kind, at }
+    }
+
+    #[test]
+    fn deadlines_follow_the_assignment() {
+        assert_eq!(INACTIVITY_TIMEOUT_SECS, 10 * 24 * 60 * 60);
+        assert_eq!(ReminderKind::Stale.due_after_secs(), 3 * 24 * 60 * 60);
+        assert_eq!(ReminderKind::ClosingSoon.due_after_secs(), 9 * 24 * 60 * 60);
+    }
+
+    #[test]
+    fn reminder_is_addressed_to_assigned_agent() {
+        let at = after(STALE_REMINDER_AFTER_SECS);
+        let ticket = assigned_ticket(&user(2, Role::Agent), T0);
+        assert_eq!(
+            ticket.decide(&remind(ReminderKind::Stale, at)),
+            Ok(TicketEvent::ReminderSent(ReminderSentEvent {
+                ticket_id: TicketId(1),
+                agent_id: Some(UserId(2)),
+                kind: ReminderKind::Stale,
+                at,
+            }))
+        );
+    }
+
+    #[test]
+    fn reminder_without_agent_is_addressed_to_admins() {
+        let at = after(STALE_REMINDER_AFTER_SECS);
+        assert_eq!(
+            open_ticket().decide(&remind(ReminderKind::Stale, at)),
+            Ok(TicketEvent::ReminderSent(ReminderSentEvent {
+                ticket_id: TicketId(1),
+                agent_id: None,
+                kind: ReminderKind::Stale,
+                at,
+            }))
+        );
+    }
+
+    #[test]
+    fn reminder_before_its_time_is_rejected() {
+        for kind in [ReminderKind::Stale, ReminderKind::ClosingSoon] {
+            let idle_secs = kind.due_after_secs() - 1;
+            assert_eq!(
+                open_ticket().decide(&remind(kind, after(idle_secs))),
+                Err(TicketError::ReminderNotDue { kind, idle_secs })
+            );
+            assert!(
+                open_ticket()
+                    .decide(&remind(kind, after(kind.due_after_secs())))
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn closed_ticket_gets_no_reminder() {
+        assert_eq!(
+            closed_ticket().decide(&remind(ReminderKind::Stale, after(INACTIVITY_TIMEOUT_SECS))),
+            Err(TicketError::Closed(TicketId(1)))
+        );
+    }
+
+    #[test]
+    fn reminder_is_not_repeated_and_goes_only_forward() {
+        let at = after(INACTIVITY_TIMEOUT_SECS - 1);
+        let stale = execute(open_ticket(), remind(ReminderKind::Stale, at));
+        assert_eq!(
+            stale.decide(&remind(ReminderKind::Stale, at)),
+            Err(TicketError::ReminderAlreadySent(ReminderKind::Stale))
+        );
+
+        let closing = execute(stale, remind(ReminderKind::ClosingSoon, at));
+        for kind in [ReminderKind::Stale, ReminderKind::ClosingSoon] {
+            assert_eq!(
+                closing.decide(&remind(kind, at)),
+                Err(TicketError::ReminderAlreadySent(kind))
+            );
+        }
+    }
+
+    #[test]
+    fn reminder_does_not_count_as_activity() {
+        let reminded = execute(
+            open_ticket(),
+            remind(ReminderKind::Stale, after(STALE_REMINDER_AFTER_SECS)),
+        );
+        assert_eq!(reminded.as_ref().unwrap().last_activity(), T0);
+        let close = TicketCommand::Close {
+            reason: CloseReason::Inactivity,
+            at: after(INACTIVITY_TIMEOUT_SECS),
+        };
+        assert!(reminded.decide(&close).is_ok());
+    }
+
+    #[test]
+    fn assignment_starts_reminders_over() {
+        let reminded = execute(
+            open_ticket(),
+            remind(ReminderKind::Stale, after(STALE_REMINDER_AFTER_SECS)),
+        );
+        let assigned_at = after(STALE_REMINDER_AFTER_SECS);
+        let assigned = execute(
+            reminded,
+            TicketCommand::AssignAgent {
+                agent: user(2, Role::Agent),
+                at: assigned_at,
+            },
+        );
+
+        let too_early = Timestamp(assigned_at.0 + STALE_REMINDER_AFTER_SECS - 1);
+        assert_eq!(
+            assigned.decide(&remind(ReminderKind::Stale, too_early)),
+            Err(TicketError::ReminderNotDue {
+                kind: ReminderKind::Stale,
+                idle_secs: STALE_REMINDER_AFTER_SECS - 1,
+            })
+        );
+        let due = Timestamp(assigned_at.0 + STALE_REMINDER_AFTER_SECS);
+        assert!(assigned.decide(&remind(ReminderKind::Stale, due)).is_ok());
+    }
+
+    #[test]
+    fn reopening_starts_reminders_over() {
+        let at = after(STALE_REMINDER_AFTER_SECS);
+        let reminded = execute(open_ticket(), remind(ReminderKind::Stale, at));
+        let closed = execute(
+            reminded,
+            TicketCommand::Close {
+                reason: CloseReason::Resolved,
+                at,
+            },
+        );
+        let reopened = execute(closed, TicketCommand::Reopen { at });
+        let due = Timestamp(at.0 + STALE_REMINDER_AFTER_SECS);
+        assert!(reopened.decide(&remind(ReminderKind::Stale, due)).is_ok());
+    }
+
+    #[test]
+    fn closed_event_names_the_agent_who_led_the_ticket() {
+        let close = TicketCommand::Close {
+            reason: CloseReason::Resolved,
+            at: T0,
+        };
+        let event = assigned_ticket(&user(2, Role::Agent), T0).decide(&close);
+        assert!(matches!(
+            event,
+            Ok(TicketEvent::Closed(TicketClosedEvent {
+                agent_id: Some(UserId(2)),
+                ..
+            }))
+        ));
+        let event = open_ticket().decide(&close);
+        assert!(matches!(
+            event,
+            Ok(TicketEvent::Closed(TicketClosedEvent {
+                agent_id: None,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn reminder_event_is_readable_in_logs() {
+        let event = |agent_id| {
+            TicketEvent::ReminderSent(ReminderSentEvent {
+                ticket_id: TicketId(1),
+                agent_id,
+                kind: ReminderKind::ClosingSoon,
+                at: Timestamp(5),
+            })
+            .to_string()
+        };
+        assert_eq!(
+            event(Some(UserId(2))),
+            format!(
+                "ReminderSent: ticket-1 (closing soon) to {} at t=5s",
+                UserId(2)
+            )
+        );
+        assert_eq!(
+            event(None),
+            "ReminderSent: ticket-1 (closing soon) to admins at t=5s"
+        );
     }
 }

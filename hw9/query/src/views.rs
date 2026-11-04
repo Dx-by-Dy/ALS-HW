@@ -20,6 +20,8 @@ pub struct TicketView {
     pub created_at: Timestamp,
     /// Когда тикет закрыли; `None`, пока он открыт.
     pub closed_at: Option<Timestamp>,
+    /// Сколько напоминаний отправлено с момента последней активности.
+    pub reminders_sent: u32,
     /// Версия последнего изменения записи.
     pub version: Version,
 }

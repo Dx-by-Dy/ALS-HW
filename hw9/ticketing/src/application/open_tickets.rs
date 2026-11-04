@@ -50,6 +50,8 @@ impl OpenTickets {
                     },
                 );
             }
+            // Напоминание — не активность: иначе тикет с напоминаниями никогда бы не закрылся.
+            TicketEvent::ReminderSent(_) => {}
         }
     }
 
@@ -78,8 +80,8 @@ mod tests {
     use super::*;
     use crate::domain::{
         ticket::{
-            AgentAssignedEvent, CloseReason, INACTIVITY_TIMEOUT_SECS, TicketClosedEvent,
-            TicketCreatedEvent, TicketReopenedEvent,
+            AgentAssignedEvent, CloseReason, INACTIVITY_TIMEOUT_SECS, ReminderKind,
+            ReminderSentEvent, TicketClosedEvent, TicketCreatedEvent, TicketReopenedEvent,
         },
         user::UserId,
     };
@@ -98,6 +100,7 @@ mod tests {
         TicketEvent::Closed(TicketClosedEvent {
             ticket_id: TicketId(ticket),
             tenant_id: TenantId(tenant),
+            agent_id: None,
             reason: CloseReason::Resolved,
             at: Timestamp(0),
         })
@@ -167,5 +170,22 @@ mod tests {
         view.project(&created(1, 1, 0));
         view.project(&closed(1, 1));
         assert!(view.inactive_at(Timestamp(u64::MAX)).is_empty());
+    }
+
+    #[test]
+    fn reminder_does_not_refresh_activity() {
+        let mut view = OpenTickets::default();
+        view.project(&created(1, 1, 0));
+        view.project(&TicketEvent::ReminderSent(ReminderSentEvent {
+            ticket_id: TicketId(1),
+            agent_id: None,
+            kind: ReminderKind::Stale,
+            at: Timestamp(100),
+        }));
+        assert_eq!(view.count_for_tenant(TenantId(1)), 1);
+        assert_eq!(
+            view.inactive_at(Timestamp(INACTIVITY_TIMEOUT_SECS)),
+            [TicketId(1)]
+        );
     }
 }

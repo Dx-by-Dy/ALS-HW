@@ -128,6 +128,7 @@ impl State {
                         tenant_id: e.tenant_id,
                         created_at: e.at,
                         closed_at: None,
+                        reminders_sent: 0,
                         version,
                     },
                 );
@@ -151,6 +152,7 @@ impl State {
                     .insert(e.ticket_id);
                 ticket.assigned_agent = Some(e.agent_id);
                 ticket.status = TicketStatus::InProgress;
+                ticket.reminders_sent = 0;
                 touch(
                     &mut self.changed,
                     Key::Ticket(e.ticket_id),
@@ -202,6 +204,7 @@ impl State {
                 // Как и агрегат, открытый заново тикет начинает без агента.
                 ticket.status = TicketStatus::Open;
                 ticket.assigned_agent = None;
+                ticket.reminders_sent = 0;
                 touch(
                     &mut self.changed,
                     Key::Ticket(e.ticket_id),
@@ -213,6 +216,19 @@ impl State {
                     &mut self.changed,
                     Key::Tenant(tenant.tenant_id),
                     &mut tenant.version,
+                    version,
+                );
+            }
+            TicketEvent::ReminderSent(e) => {
+                let ticket = self
+                    .tickets
+                    .get_mut(&e.ticket_id)
+                    .ok_or(ProjectionError::UnknownTicket(e.ticket_id))?;
+                ticket.reminders_sent += 1;
+                touch(
+                    &mut self.changed,
+                    Key::Ticket(e.ticket_id),
+                    &mut ticket.version,
                     version,
                 );
             }
@@ -371,8 +387,8 @@ pub(crate) mod tests {
     use ticketing::domain::{
         tenant::{DiscountAppliedEvent, TenantRegisteredEvent},
         ticket::{
-            AgentAssignedEvent, CloseReason, TicketClosedEvent, TicketCreatedEvent,
-            TicketReopenedEvent,
+            AgentAssignedEvent, CloseReason, ReminderKind, ReminderSentEvent, TicketClosedEvent,
+            TicketCreatedEvent, TicketReopenedEvent,
         },
         user::{Role, UserRegisteredEvent},
     };
@@ -424,8 +440,19 @@ pub(crate) mod tests {
         TicketEvent::Closed(TicketClosedEvent {
             ticket_id: TicketId(ticket),
             tenant_id,
+            agent_id: None,
             reason: CloseReason::Resolved,
             at: Timestamp(at),
+        })
+        .into()
+    }
+
+    pub fn reminder(ticket: usize) -> DomainEvent {
+        TicketEvent::ReminderSent(ReminderSentEvent {
+            ticket_id: TicketId(ticket),
+            agent_id: None,
+            kind: ReminderKind::Stale,
+            at: Timestamp(0),
         })
         .into()
     }
@@ -517,6 +544,7 @@ pub(crate) mod tests {
                 tenant_id: ACME,
                 created_at: Timestamp(10),
                 closed_at: None,
+                reminders_sent: 0,
                 version: Version(5),
             })
         );
@@ -571,6 +599,45 @@ pub(crate) mod tests {
         assert_eq!(ticket.closed_at, None);
         assert!(state.tickets_closed_since(Timestamp(0)).is_empty());
         assert_eq!(open_tickets(&state, ACME), 1);
+    }
+
+    #[test]
+    fn reminder_is_counted_and_shows_in_changes() {
+        let state = with([created(1, ACME, 0), reminder(1), reminder(1)]);
+        let ticket = state.ticket(TicketId(1)).unwrap();
+        assert_eq!(ticket.reminders_sent, 2);
+        assert_eq!(ticket.status, TicketStatus::Open);
+        assert_eq!(ticket.version, Version(7));
+        assert_eq!(state.changes_since(Version(6)).tickets, [ticket]);
+    }
+
+    #[test]
+    fn activity_starts_reminder_count_over() {
+        let assigned = with([created(1, ACME, 0), reminder(1), assigned(1, ALICE, None)]);
+        assert_eq!(assigned.ticket(TicketId(1)).unwrap().reminders_sent, 0);
+
+        let reopened = with([
+            created(1, ACME, 0),
+            reminder(1),
+            closed(1, ACME, 0),
+            reopened(1, ACME),
+        ]);
+        assert_eq!(reopened.ticket(TicketId(1)).unwrap().reminders_sent, 0);
+    }
+
+    #[test]
+    fn reminder_for_unknown_ticket_changes_nothing() {
+        let mut state = with([]);
+        let version = state.version();
+        let event = Envelope {
+            version: version.next(),
+            event: reminder(1),
+        };
+        assert_eq!(
+            state.apply(&event),
+            Err(ProjectionError::UnknownTicket(TicketId(1)))
+        );
+        assert_eq!(state.version(), version);
     }
 
     #[test]

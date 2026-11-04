@@ -4,7 +4,7 @@ use super::{
     clock::Clock,
     commands::{
         ApplyDiscountCommand, AssignAgentCommand, CloseTicketCommand, CreateTicketCommand,
-        RegisterTenantCommand, RegisterUserCommand, ReopenTicketCommand,
+        RegisterTenantCommand, RegisterUserCommand, ReopenTicketCommand, SendReminderCommand,
     },
     error::ServiceError,
     open_tickets::OpenTickets,
@@ -157,6 +157,17 @@ impl<C: Clock> TicketService<C> {
             .await
     }
 
+    pub async fn handle_send_reminder(
+        &mut self,
+        command: SendReminderCommand,
+    ) -> Result<TicketEvent, ServiceError> {
+        let remind = TicketCommand::SendReminder {
+            kind: command.kind,
+            at: self.clock.now(),
+        };
+        self.execute_ticket(command.ticket_id, remind).await
+    }
+
     /// Закрывает все тикеты, простоявшие без активности дольше таймаута.
     pub async fn close_inactive_tickets(&mut self) -> Result<Vec<TicketEvent>, ServiceError> {
         let now = self.clock.now();
@@ -253,8 +264,9 @@ mod tests {
     use crate::domain::{
         tenant::{DiscountAppliedEvent, DiscountRate, TenantError},
         ticket::{
-            AgentAssignedEvent, INACTIVITY_TIMEOUT_SECS, TicketClosedEvent, TicketCreatedEvent,
-            TicketError, TicketReopenedEvent, TicketStatus,
+            AgentAssignedEvent, INACTIVITY_TIMEOUT_SECS, ReminderKind, ReminderSentEvent,
+            STALE_REMINDER_AFTER_SECS, TicketClosedEvent, TicketCreatedEvent, TicketError,
+            TicketReopenedEvent, TicketStatus,
         },
         time::Timestamp,
         user::Role,
@@ -446,6 +458,7 @@ mod tests {
             Ok(TicketEvent::Closed(TicketClosedEvent {
                 ticket_id,
                 tenant_id: f.tenant_id,
+                agent_id: None,
                 reason: CloseReason::Resolved,
                 at: Timestamp(0)
             }))
@@ -552,6 +565,7 @@ mod tests {
             Ok(vec![TicketEvent::Closed(TicketClosedEvent {
                 ticket_id: stale,
                 tenant_id: f.tenant_id,
+                agent_id: None,
                 reason: CloseReason::Inactivity,
                 at: Timestamp(INACTIVITY_TIMEOUT_SECS),
             })])
@@ -725,5 +739,58 @@ mod tests {
                 .await,
             Err(ServiceError::User(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn reminder_goes_to_outbox_and_does_not_delay_closing() {
+        let mut f = fixture().await;
+        let ticket_id = f.create_ticket().await;
+        f.assign(ticket_id, f.agent_id).await.unwrap();
+        f.service.take_outbox();
+
+        f.clock.advance(STALE_REMINDER_AFTER_SECS);
+        let reminder = TicketEvent::ReminderSent(ReminderSentEvent {
+            ticket_id,
+            agent_id: Some(f.agent_id),
+            kind: ReminderKind::Stale,
+            at: Timestamp(STALE_REMINDER_AFTER_SECS),
+        });
+        let command = SendReminderCommand {
+            ticket_id,
+            kind: ReminderKind::Stale,
+        };
+        assert_eq!(
+            f.service.handle_send_reminder(command).await,
+            Ok(reminder.clone())
+        );
+        assert_eq!(f.service.take_outbox(), [DomainEvent::Ticket(reminder)]);
+
+        f.clock
+            .advance(INACTIVITY_TIMEOUT_SECS - STALE_REMINDER_AFTER_SECS);
+        assert_eq!(f.service.close_inactive_tickets().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejected_reminder_writes_nothing() {
+        let mut f = fixture().await;
+        let ticket_id = f.create_ticket().await;
+        f.service.take_outbox();
+        let early = SendReminderCommand {
+            ticket_id,
+            kind: ReminderKind::Stale,
+        };
+        assert!(matches!(
+            f.service.handle_send_reminder(early).await,
+            Err(ServiceError::Ticket(TicketError::ReminderNotDue { .. }))
+        ));
+        let missing = SendReminderCommand {
+            ticket_id: TicketId(99),
+            kind: ReminderKind::Stale,
+        };
+        assert_eq!(
+            f.service.handle_send_reminder(missing).await,
+            Err(ServiceError::Ticket(TicketError::NotFound))
+        );
+        assert!(f.service.take_outbox().is_empty());
     }
 }

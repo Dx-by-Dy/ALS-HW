@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-use super::TicketId;
+use super::{ReminderKind, TicketId};
 use crate::domain::user::{Role, UserId};
 
 /// Нарушения инвариантов агрегата `Ticket`.
@@ -23,6 +23,10 @@ pub enum TicketError {
     AlreadyOpen(TicketId),
     /// Закрыть по неактивности можно только тикет, простоявший дольше таймаута.
     StillActive { idle_secs: u64 },
+    /// Тикет простаивает недостаточно долго для такого напоминания.
+    ReminderNotDue { kind: ReminderKind, idle_secs: u64 },
+    /// С последней активности уже отправлено это или более позднее напоминание.
+    ReminderAlreadySent(ReminderKind),
 }
 
 impl fmt::Display for TicketError {
@@ -44,6 +48,18 @@ impl fmt::Display for TicketError {
                 write!(
                     f,
                     "ticket was active {idle_secs}s ago and cannot be closed for inactivity"
+                )
+            }
+            Self::ReminderNotDue { kind, idle_secs } => {
+                write!(
+                    f,
+                    "ticket was active {idle_secs}s ago, the {kind} reminder is not due yet"
+                )
+            }
+            Self::ReminderAlreadySent(kind) => {
+                write!(
+                    f,
+                    "the {kind} reminder is no longer needed: it or a later one was sent"
                 )
             }
         }

@@ -1,6 +1,6 @@
 use ticketing::application::commands::{
     ApplyDiscountCommand, AssignAgentCommand, CloseTicketCommand, CreateTicketCommand,
-    RegisterTenantCommand, RegisterUserCommand, ReopenTicketCommand,
+    RegisterTenantCommand, RegisterUserCommand, ReopenTicketCommand, SendReminderCommand,
 };
 
 /// Любая команда, которую принимает командная сторона.
@@ -12,6 +12,7 @@ pub enum Command {
     AssignAgent(AssignAgentCommand),
     CloseTicket(CloseTicketCommand),
     ReopenTicket(ReopenTicketCommand),
+    SendReminder(SendReminderCommand),
     ApplyDiscount(ApplyDiscountCommand),
     /// Закрыть все тикеты, у которых истёк таймаут неактивности.
     CloseInactiveTickets,
@@ -36,5 +37,6 @@ impl_from_command!(
     AssignAgent(AssignAgentCommand),
     CloseTicket(CloseTicketCommand),
     ReopenTicket(ReopenTicketCommand),
+    SendReminder(SendReminderCommand),
     ApplyDiscount(ApplyDiscountCommand),
 );

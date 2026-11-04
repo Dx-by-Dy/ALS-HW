@@ -71,6 +71,7 @@ impl<C: Clock> CommandActor<C> {
             Command::AssignAgent(c) => service.handle_assign_agent(c).await.map(drop),
             Command::CloseTicket(c) => service.handle_close_ticket(c).await.map(drop),
             Command::ReopenTicket(c) => service.handle_reopen_ticket(c).await.map(drop),
+            Command::SendReminder(c) => service.handle_send_reminder(c).await.map(drop),
             Command::ApplyDiscount(c) => service.handle_apply_discount(c).await.map(drop),
             Command::CloseInactiveTickets => service.close_inactive_tickets().await.map(drop),
         }
@@ -121,12 +122,15 @@ mod tests {
         clock::ManualClock,
         commands::{
             AssignAgentCommand, CloseTicketCommand, CreateTicketCommand, RegisterTenantCommand,
-            RegisterUserCommand,
+            RegisterUserCommand, SendReminderCommand,
         },
     };
     use ticketing::domain::{
         tenant::TenantId,
-        ticket::{CloseReason, INACTIVITY_TIMEOUT_SECS, TicketEvent, TicketId},
+        ticket::{
+            CloseReason, INACTIVITY_TIMEOUT_SECS, ReminderKind, STALE_REMINDER_AFTER_SECS,
+            TicketError, TicketEvent, TicketId,
+        },
         user::{Role, UserId},
     };
 
@@ -265,5 +269,29 @@ mod tests {
         }
         versions.sort();
         assert_eq!(versions, (3..=12).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn reminder_is_published_and_early_one_takes_no_version() {
+        let (bus, clock) = bus_with_tenant().await;
+        bus.send(ticket(TenantId(1))).await.unwrap();
+        let reminder = SendReminderCommand {
+            ticket_id: TicketId(1),
+            kind: ReminderKind::Stale,
+        };
+        assert!(matches!(
+            bus.send(reminder).await,
+            Err(CommandError::Rejected(ServiceError::Ticket(
+                TicketError::ReminderNotDue { .. }
+            )))
+        ));
+
+        clock.advance(STALE_REMINDER_AFTER_SECS);
+        let committed = bus.send(reminder).await.unwrap();
+        assert_eq!(versions(&committed), [4]);
+        assert!(matches!(
+            committed.events[0].event,
+            DomainEvent::Ticket(TicketEvent::ReminderSent(_))
+        ));
     }
 }

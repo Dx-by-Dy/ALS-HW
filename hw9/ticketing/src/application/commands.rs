@@ -5,7 +5,7 @@
 
 use crate::domain::{
     tenant::TenantId,
-    ticket::{CloseReason, TicketId},
+    ticket::{CloseReason, ReminderKind, TicketId},
     user::{Role, UserId},
 };
 
@@ -73,6 +73,12 @@ pub struct CloseTicketCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReopenTicketCommand {
     pub ticket_id: TicketId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendReminderCommand {
+    pub ticket_id: TicketId,
+    pub kind: ReminderKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

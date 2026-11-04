@@ -20,7 +20,7 @@ impl Policy<DomainEvent> for DiscountPolicy {
             DomainEvent::Ticket(TicketEvent::Created(e)) => e.tenant_id,
             DomainEvent::Ticket(TicketEvent::Closed(e)) => e.tenant_id,
             DomainEvent::Ticket(TicketEvent::Reopened(e)) => e.tenant_id,
-            DomainEvent::Ticket(TicketEvent::AgentAssigned(_))
+            DomainEvent::Ticket(TicketEvent::AgentAssigned(_) | TicketEvent::ReminderSent(_))
             | DomainEvent::Tenant(_)
             | DomainEvent::User(_) => return Vec::new(),
         };
@@ -34,8 +34,8 @@ mod tests {
     use crate::domain::{
         tenant::{DiscountAppliedEvent, DiscountRate, TenantEvent, TenantId},
         ticket::{
-            AgentAssignedEvent, CloseReason, TicketClosedEvent, TicketCreatedEvent, TicketId,
-            TicketReopenedEvent,
+            AgentAssignedEvent, CloseReason, ReminderKind, ReminderSentEvent, TicketClosedEvent,
+            TicketCreatedEvent, TicketId, TicketReopenedEvent,
         },
         time::Timestamp,
         user::UserId,
@@ -61,6 +61,7 @@ mod tests {
         let closed = TicketEvent::Closed(TicketClosedEvent {
             ticket_id: TICKET,
             tenant_id: ACME,
+            agent_id: None,
             reason: CloseReason::Inactivity,
             at: Timestamp(0),
         });
@@ -83,6 +84,14 @@ mod tests {
             at: Timestamp(0),
         });
         assert!(react(assigned).is_empty());
+
+        let reminder = TicketEvent::ReminderSent(ReminderSentEvent {
+            ticket_id: TICKET,
+            agent_id: None,
+            kind: ReminderKind::Stale,
+            at: Timestamp(0),
+        });
+        assert!(react(reminder).is_empty());
 
         // Иначе политика реагировала бы на собственный результат.
         let discount = TenantEvent::DiscountApplied(DiscountAppliedEvent {

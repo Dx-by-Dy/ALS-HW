@@ -1,6 +1,6 @@
 use std::fmt;
 
-use super::{CloseReason, TicketId};
+use super::{CloseReason, ReminderKind, TicketId};
 use crate::domain::{tenant::TenantId, time::Timestamp, user::UserId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9,6 +9,7 @@ pub enum TicketEvent {
     AgentAssigned(AgentAssignedEvent),
     Closed(TicketClosedEvent),
     Reopened(TicketReopenedEvent),
+    ReminderSent(ReminderSentEvent),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +35,8 @@ pub struct TicketClosedEvent {
     pub ticket_id: TicketId,
     /// Нужен тем, кто следит за тикетами тенанта: проекциям и политике скидок.
     pub tenant_id: TenantId,
+    /// Агент, который вёл тикет: его нужно предупредить о закрытии.
+    pub agent_id: Option<UserId>,
     pub reason: CloseReason,
     pub at: Timestamp,
 }
@@ -46,6 +49,17 @@ pub struct TicketReopenedEvent {
     pub at: Timestamp,
 }
 
+/// Напоминание о простаивающем тикете. Это не активность: отсчёт неактивности оно не сбрасывает,
+/// иначе тикет с напоминаниями никогда бы не закрылся.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReminderSentEvent {
+    pub ticket_id: TicketId,
+    /// Кому напомнить; `None` — агента нет, и напоминание адресовано администраторам.
+    pub agent_id: Option<UserId>,
+    pub kind: ReminderKind,
+    pub at: Timestamp,
+}
+
 impl TicketEvent {
     pub fn ticket_id(&self) -> TicketId {
         match self {
@@ -53,6 +67,7 @@ impl TicketEvent {
             Self::AgentAssigned(e) => e.ticket_id,
             Self::Closed(e) => e.ticket_id,
             Self::Reopened(e) => e.ticket_id,
+            Self::ReminderSent(e) => e.ticket_id,
         }
     }
 }
@@ -80,6 +95,14 @@ impl fmt::Display for TicketEvent {
                 )
             }
             Self::Reopened(e) => write!(f, "TicketReopened: {} at {}", e.ticket_id, e.at),
+            Self::ReminderSent(e) => {
+                write!(f, "ReminderSent: {} ({}) to ", e.ticket_id, e.kind)?;
+                match e.agent_id {
+                    Some(agent) => write!(f, "{agent}")?,
+                    None => f.write_str("admins")?,
+                }
+                write!(f, " at {}", e.at)
+            }
         }
     }
 }
