@@ -95,20 +95,33 @@ pub fn app<C: Clock + Clone + Send + Sync + 'static>(clock: C, config: Config) -
         .route("/api/tickets/{id}/open", post(commands::open_ticket))
         .route("/api/tickets/{id}/close", post(commands::close_ticket))
         .route("/api/tickets/{id}/assign", post(commands::assign_agent))
-        .route("/api/tickets", get(queries::list_tickets))
+        .route(
+            "/api/tickets",
+            get(queries::list_tickets).post(commands::create_ticket),
+        )
         .route("/api/tickets/closed", get(queries::tickets_closed_within))
         .route("/api/tickets/{id}", get(queries::get_ticket))
         .route(
             "/api/agents/{id}/tickets",
             get(queries::active_tickets_of_agent),
         )
-        .route("/api/tenants", get(queries::list_tenants))
+        .route(
+            "/api/tenants",
+            get(queries::list_tenants).post(commands::create_tenant),
+        )
         .route("/api/tenants/{id}", get(queries::get_tenant))
         .route(
             "/api/tenants/{id}/tickets/unassigned",
             get(queries::unassigned_tickets_of_tenant),
         )
-        .route("/api/users", get(queries::list_users))
+        .route(
+            "/api/users",
+            get(queries::list_users).post(commands::create_user),
+        )
+        .route(
+            "/api/users/{id}/notifications",
+            get(queries::notifications_of),
+        )
         .route("/api/changes", get(queries::changes))
         .with_state(state);
     App {
@@ -204,9 +217,10 @@ fn is_discount_unchanged(e: &CommandError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use api::Role;
     use api::{
-        ChangesDto, CommandAcceptedDto, Cursor, ErrorDto, TenantDto, TicketDto, TicketStatus,
-        UserDto,
+        ChangesDto, CloseReason, CommandAcceptedDto, Cursor, ErrorDto, NotificationDto,
+        NotificationKind, Recipient, ReminderKind, TenantDto, TicketDto, TicketStatus, UserDto,
     };
     use axum::{
         body::Body,
@@ -215,7 +229,7 @@ mod tests {
     use http_body_util::BodyExt;
     use serde::de::DeserializeOwned;
     use ticketing::application::clock::ManualClock;
-    use ticketing::domain::ticket::INACTIVITY_TIMEOUT_SECS;
+    use ticketing::domain::ticket::{INACTIVITY_TIMEOUT_SECS, STALE_REMINDER_AFTER_SECS};
     use tower::ServiceExt;
 
     /// Номера тикетов и пользователей из [`seed`].
@@ -225,6 +239,7 @@ mod tests {
     const AGENT_ALICE: usize = 1;
     const AGENT_CAROL: usize = 2;
     const CUSTOMER_BOB: usize = 3;
+    const ADMIN_DAVE: usize = 4;
     const ACME: usize = 1;
     const GLOBEX: usize = 2;
     const DAY: u64 = 24 * 60 * 60;
@@ -253,6 +268,25 @@ mod tests {
         seed(&app.commands).await.unwrap();
         let router = app.router;
         wait_for_tenant(&router, ACME, |t| t.discount_percent == 10).await;
+        let all: ChangesDto = get(&router, &api::changes(None)).await;
+        TestApp {
+            router,
+            clock,
+            settled: all.cursor(),
+        }
+    }
+
+    /// Система без демо-данных: так сервер стартует без `--seed`.
+    async fn empty_app(deadline_tick: Duration) -> TestApp {
+        let clock = ManualClock::default();
+        let app = app(
+            clock.clone(),
+            Config {
+                long_poll: WAIT,
+                deadline_tick,
+            },
+        );
+        let router = app.router;
         let all: ChangesDto = get(&router, &api::changes(None)).await;
         TestApp {
             router,
@@ -451,6 +485,166 @@ mod tests {
         assert_eq!(ids(&last_month), [CLOSED, OPEN]);
     }
 
+    const NEVER: Duration = Duration::from_secs(3600);
+
+    /// Заводит через HTTP то, что раньше мог только seed: тенанта, агента и тикет.
+    async fn acme_alice_and_ticket(app: &TestApp) {
+        app.command(api::TENANTS, Some(r#"{"tenant_name":"Acme"}"#))
+            .await;
+        app.command(api::USERS, Some(r#"{"user_name":"Alice","role":"Agent"}"#))
+            .await;
+        app.command(
+            api::TICKETS,
+            Some(r#"{"category":"Billing","description":"Wrong invoice","tenant_id":1}"#),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn empty_system_is_filled_through_commands() {
+        let app = empty_app(NEVER).await;
+        let tickets: Vec<TicketDto> = app.get(api::TICKETS).await;
+        assert_eq!(tickets, []);
+
+        acme_alice_and_ticket(&app).await;
+        let tenants: Vec<TenantDto> = app.get(api::TENANTS).await;
+        assert_eq!(tenants[0].tenant_name, "Acme");
+        assert_eq!(tenants[0].open_tickets, 1);
+        let users: Vec<UserDto> = app.get(api::USERS).await;
+        assert_eq!(users[0].user_name, "Alice");
+        assert_eq!(users[0].role, Role::Agent);
+        let tickets: Vec<TicketDto> = app.get(api::TICKETS).await;
+        assert_eq!(tickets[0].category, "Billing");
+        assert_eq!(tickets[0].tenant_id, 1);
+        assert_eq!(tickets[0].status, TicketStatus::Open);
+    }
+
+    #[tokio::test]
+    async fn creating_with_bad_data_is_rejected() {
+        let app = empty_app(NEVER).await;
+        let cases = [
+            (
+                api::TENANTS,
+                r#"{"tenant_name":"  "}"#,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                api::USERS,
+                r#"{"user_name":"","role":"Agent"}"#,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                api::TICKETS,
+                r#"{"category":"Billing","description":"Invoice","tenant_id":99}"#,
+                StatusCode::NOT_FOUND,
+            ),
+        ];
+        for (uri, body, expected) in cases {
+            let (status, _): (_, ErrorDto) = app.send("POST", uri, Some(body)).await;
+            assert_eq!(status, expected, "POST {uri} {body}");
+        }
+
+        app.command(api::TENANTS, Some(r#"{"tenant_name":"Acme"}"#))
+            .await;
+        for body in [
+            r#"{"category":"Billing","description":" ","tenant_id":1}"#,
+            r#"{"category":" ","description":"Invoice","tenant_id":1}"#,
+        ] {
+            let (status, _): (_, ErrorDto) = app.send("POST", api::TICKETS, Some(body)).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ticket_shows_its_deadline_and_how_it_was_closed() {
+        let app = empty_app(NEVER).await;
+        acme_alice_and_ticket(&app).await;
+        let ticket: TicketDto = app.get(&api::ticket(1)).await;
+        assert_eq!(ticket.last_activity, 0);
+        assert_eq!(ticket.closes_at, Some(INACTIVITY_TIMEOUT_SECS));
+        assert_eq!(ticket.close_reason, None);
+
+        app.clock.advance(DAY);
+        app.command(&api::assign_agent(1), Some(r#"{"agent_id":1}"#))
+            .await;
+        let ticket: TicketDto = app.get(&api::ticket(1)).await;
+        assert_eq!(ticket.last_activity, DAY);
+        assert_eq!(ticket.closes_at, Some(DAY + INACTIVITY_TIMEOUT_SECS));
+
+        app.command(&api::close_ticket(1), None).await;
+        let ticket: TicketDto = app.get(&api::ticket(1)).await;
+        assert_eq!(ticket.close_reason, Some(CloseReason::Resolved));
+        assert_eq!(ticket.closes_at, None);
+    }
+
+    #[tokio::test]
+    async fn inbox_is_personal_for_agents_and_shared_by_admins() {
+        let app = seeded_app().await;
+        let of_alice: Vec<NotificationDto> = app.get(&api::notifications_of(AGENT_ALICE)).await;
+        assert_eq!(of_alice.len(), 1);
+        assert_eq!(of_alice[0].recipient, Recipient::Agent(AGENT_ALICE));
+        assert_eq!(of_alice[0].kind, NotificationKind::Assigned);
+        assert_eq!(of_alice[0].ticket_id, ASSIGNED);
+
+        let of_dave: Vec<NotificationDto> = app.get(&api::notifications_of(ADMIN_DAVE)).await;
+        assert_eq!(of_dave.len(), 9);
+        assert!(of_dave.iter().all(|n| n.recipient == Recipient::Admins));
+
+        let of_bob: Vec<NotificationDto> = app.get(&api::notifications_of(CUSTOMER_BOB)).await;
+        assert_eq!(of_bob, []);
+        let of_nobody: Vec<NotificationDto> = app.get(&api::notifications_of(99)).await;
+        assert_eq!(of_nobody, []);
+    }
+
+    #[tokio::test]
+    async fn long_polling_brings_new_notifications_once() {
+        let app = seeded_app().await;
+        let all: ChangesDto = app.get(&api::changes(None)).await;
+        assert_eq!(all.notifications.len(), 10);
+
+        app.command(
+            &api::assign_agent(OPEN),
+            Some(&format!(r#"{{"agent_id":{AGENT_CAROL}}}"#)),
+        )
+        .await;
+        let changes: ChangesDto = app.get(&api::changes(Some(all.cursor()))).await;
+        assert_eq!(changes.notifications.len(), 1);
+        assert_eq!(
+            changes.notifications[0].recipient,
+            Recipient::Agent(AGENT_CAROL)
+        );
+        assert_eq!(changes.notifications[0].kind, NotificationKind::Assigned);
+    }
+
+    #[tokio::test]
+    async fn reminders_reach_ticket_and_inbox_over_http() {
+        let app = empty_app(Duration::from_millis(1)).await;
+        acme_alice_and_ticket(&app).await;
+        app.command(&api::assign_agent(1), Some(r#"{"agent_id":1}"#))
+            .await;
+        app.clock.advance(STALE_REMINDER_AFTER_SECS);
+
+        let wait = async {
+            let mut after = None;
+            loop {
+                let changes: ChangesDto = app.get(&api::changes(after)).await;
+                if changes.tickets.iter().any(|t| t.reminders_sent == 1) {
+                    return;
+                }
+                after = Some(changes.cursor());
+            }
+        };
+        tokio::time::timeout(WAIT, wait)
+            .await
+            .expect("the reminder arrives");
+
+        let inbox: Vec<NotificationDto> = app.get(&api::notifications_of(1)).await;
+        assert_eq!(
+            inbox.last().map(|n| n.kind),
+            Some(NotificationKind::Reminder(ReminderKind::Stale))
+        );
+    }
+
     #[tokio::test]
     async fn tickets_are_closed_by_deadline_and_discount_follows() {
         let app = settled_app_with(Config {
@@ -467,6 +661,12 @@ mod tests {
         wait_for_tenant(&app.router, GLOBEX, |t| t.open_tickets == 0).await;
         let closed: Vec<TicketDto> = app.get("/api/tickets?status=Closed").await;
         assert_eq!(closed.len(), 9);
+        // Седьмой тикет закрыли вручную ещё в seed, остальные закрылись сами.
+        let auto_closed = closed
+            .iter()
+            .filter(|t| t.close_reason == Some(CloseReason::Inactivity))
+            .count();
+        assert_eq!(auto_closed, 8);
     }
 
     #[test]

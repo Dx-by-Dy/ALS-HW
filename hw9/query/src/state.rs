@@ -2,17 +2,21 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
 
-use framework::cqrs::envelope::{Envelope, Version};
+use framework::cqrs::{
+    envelope::{Envelope, Version},
+    policy::Policy,
+};
+use ticketing::application::notifications::{NotificationPolicy, Recipient};
 use ticketing::domain::{
     DomainEvent,
     tenant::{DiscountRate, TenantEvent, TenantId},
     ticket::{TicketEvent, TicketId, TicketStatus},
     time::Timestamp,
-    user::{UserEvent, UserId},
+    user::{Role, UserEvent, UserId},
 };
 
 use crate::queries::ListTickets;
-use crate::views::{Changes, TenantView, TicketView, UserView};
+use crate::views::{Changes, NotificationId, NotificationView, TenantView, TicketView, UserView};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectionError {
@@ -45,6 +49,7 @@ enum Key {
     Ticket(TicketId),
     Tenant(TenantId),
     User(UserId),
+    Notification(NotificationId),
 }
 
 /// Содержимое read-модели: записи и индексы под запросы.
@@ -57,6 +62,10 @@ pub(crate) struct State {
     tickets: BTreeMap<TicketId, TicketView>,
     tenants: BTreeMap<TenantId, TenantView>,
     users: BTreeMap<UserId, UserView>,
+    /// Все уведомления в порядке появления: номер уведомления на единицу больше позиции.
+    notifications: Vec<NotificationView>,
+    /// Позиции уведомлений каждого получателя.
+    inbox: HashMap<Recipient, Vec<usize>>,
     /// Незакрытые тикеты каждого агента.
     active_by_agent: HashMap<UserId, BTreeSet<TicketId>>,
     /// Все тикеты каждого тенанта.
@@ -92,8 +101,31 @@ impl State {
             DomainEvent::Tenant(event) => self.apply_tenant(event, version)?,
             DomainEvent::User(event) => self.apply_user(event, version),
         }
+        self.add_notifications(&envelope.event, version);
         self.version = version;
         Ok(())
+    }
+
+    /// Те же правила, по которым уведомления доставляются наружу, наполняют входящие.
+    fn add_notifications(&mut self, event: &DomainEvent, version: Version) {
+        for notification in NotificationPolicy.react(event) {
+            let position = self.notifications.len();
+            let notification_id = NotificationId(position + 1);
+            self.notifications.push(NotificationView {
+                notification_id,
+                recipient: notification.recipient,
+                ticket_id: notification.ticket_id,
+                kind: notification.kind,
+                at: notification.at,
+                version,
+            });
+            self.inbox
+                .entry(notification.recipient)
+                .or_default()
+                .push(position);
+            self.changed
+                .insert((version, Key::Notification(notification_id)));
+        }
     }
 
     // Каждый обработчик сначала находит все нужные записи и только потом меняет их:
@@ -128,6 +160,8 @@ impl State {
                         tenant_id: e.tenant_id,
                         created_at: e.at,
                         closed_at: None,
+                        close_reason: None,
+                        last_activity: e.at,
                         reminders_sent: 0,
                         version,
                     },
@@ -152,6 +186,7 @@ impl State {
                     .insert(e.ticket_id);
                 ticket.assigned_agent = Some(e.agent_id);
                 ticket.status = TicketStatus::InProgress;
+                ticket.last_activity = e.at;
                 ticket.reminders_sent = 0;
                 touch(
                     &mut self.changed,
@@ -175,6 +210,7 @@ impl State {
                 self.closed.insert((e.at, e.ticket_id));
                 ticket.status = TicketStatus::Closed;
                 ticket.closed_at = Some(e.at);
+                ticket.close_reason = Some(e.reason);
                 touch(
                     &mut self.changed,
                     Key::Ticket(e.ticket_id),
@@ -204,6 +240,8 @@ impl State {
                 // Как и агрегат, открытый заново тикет начинает без агента.
                 ticket.status = TicketStatus::Open;
                 ticket.assigned_agent = None;
+                ticket.close_reason = None;
+                ticket.last_activity = e.at;
                 ticket.reminders_sent = 0;
                 touch(
                     &mut self.changed,
@@ -336,6 +374,18 @@ impl State {
         self.users.values().cloned().collect()
     }
 
+    pub fn notifications_of(&self, user_id: UserId) -> Vec<NotificationView> {
+        let recipient = match self.users.get(&user_id).map(|user| user.role) {
+            Some(Role::Agent) => Recipient::Agent(user_id),
+            Some(Role::Admin) => Recipient::Admins,
+            Some(Role::Customer) | None => return Vec::new(),
+        };
+        let positions = self.inbox.get(&recipient).into_iter().flatten();
+        positions
+            .map(|position| self.notifications[*position].clone())
+            .collect()
+    }
+
     pub fn changes_since(&self, after: Version) -> Changes {
         let mut changes = Changes {
             version: self.version,
@@ -349,6 +399,9 @@ impl State {
                 Key::Ticket(id) => changes.tickets.push(self.tickets[id].clone()),
                 Key::Tenant(id) => changes.tenants.push(self.tenants[id].clone()),
                 Key::User(id) => changes.users.push(self.users[id].clone()),
+                Key::Notification(id) => changes
+                    .notifications
+                    .push(self.notifications[id.0 - 1].clone()),
             }
         }
         changes
@@ -384,11 +437,12 @@ fn remove_from(index: &mut HashMap<UserId, BTreeSet<TicketId>>, agent: UserId, t
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use ticketing::application::notifications::NotificationKind;
     use ticketing::domain::{
         tenant::{DiscountAppliedEvent, TenantRegisteredEvent},
         ticket::{
-            AgentAssignedEvent, CloseReason, ReminderKind, ReminderSentEvent, TicketClosedEvent,
-            TicketCreatedEvent, TicketReopenedEvent,
+            AgentAssignedEvent, CloseReason, INACTIVITY_TIMEOUT_SECS, ReminderKind,
+            ReminderSentEvent, TicketClosedEvent, TicketCreatedEvent, TicketReopenedEvent,
         },
         user::{Role, UserRegisteredEvent},
     };
@@ -544,6 +598,8 @@ pub(crate) mod tests {
                 tenant_id: ACME,
                 created_at: Timestamp(10),
                 closed_at: None,
+                close_reason: None,
+                last_activity: Timestamp(10),
                 reminders_sent: 0,
                 version: Version(5),
             })
@@ -599,6 +655,153 @@ pub(crate) mod tests {
         assert_eq!(ticket.closed_at, None);
         assert!(state.tickets_closed_since(Timestamp(0)).is_empty());
         assert_eq!(open_tickets(&state, ACME), 1);
+    }
+
+    fn assigned_at(ticket: usize, agent_id: UserId, at: u64) -> DomainEvent {
+        TicketEvent::AgentAssigned(AgentAssignedEvent {
+            ticket_id: TicketId(ticket),
+            agent_id,
+            previous_agent_id: None,
+            at: Timestamp(at),
+        })
+        .into()
+    }
+
+    fn admin(user_id: UserId, name: &str) -> DomainEvent {
+        UserEvent::Registered(UserRegisteredEvent {
+            user_id,
+            user_name: name.to_owned(),
+            role: Role::Admin,
+        })
+        .into()
+    }
+
+    const DAVE: UserId = UserId(50);
+
+    #[test]
+    fn closing_time_follows_last_activity() {
+        let timeout = INACTIVITY_TIMEOUT_SECS;
+        let state = with([created(1, ACME, 10)]);
+        let ticket = state.ticket(TicketId(1)).unwrap();
+        assert_eq!(ticket.closes_at(), Some(Timestamp(10 + timeout)));
+
+        let state = with([created(1, ACME, 10), assigned_at(1, ALICE, 20)]);
+        let ticket = state.ticket(TicketId(1)).unwrap();
+        assert_eq!(ticket.last_activity, Timestamp(20));
+        assert_eq!(ticket.closes_at(), Some(Timestamp(20 + timeout)));
+
+        // Напоминание — не активность.
+        let state = with([created(1, ACME, 10), reminder(1)]);
+        let ticket = state.ticket(TicketId(1)).unwrap();
+        assert_eq!(ticket.last_activity, Timestamp(10));
+    }
+
+    #[test]
+    fn closed_ticket_has_reason_and_no_closing_time() {
+        let state = with([created(1, ACME, 0), closed(1, ACME, 30)]);
+        let ticket = state.ticket(TicketId(1)).unwrap();
+        assert_eq!(ticket.close_reason, Some(CloseReason::Resolved));
+        assert_eq!(ticket.closes_at(), None);
+
+        let state = with([created(1, ACME, 0), closed(1, ACME, 30), reopened(1, ACME)]);
+        let ticket = state.ticket(TicketId(1)).unwrap();
+        assert_eq!(ticket.close_reason, None);
+        assert!(ticket.closes_at().is_some());
+    }
+
+    #[test]
+    fn agent_sees_only_own_notifications_in_order() {
+        let state = with([
+            created(1, ACME, 0),
+            created(2, ACME, 0),
+            assigned_at(1, ALICE, 5),
+            assigned_at(2, CAROL, 6),
+            closed(1, ACME, 7),
+        ]);
+        let of_alice = state.notifications_of(ALICE);
+        assert_eq!(of_alice.len(), 1);
+        assert_eq!(of_alice[0].ticket_id, TicketId(1));
+        assert_eq!(of_alice[0].kind, NotificationKind::Assigned);
+        assert_eq!(of_alice[0].at, Timestamp(5));
+        assert_eq!(state.notifications_of(CAROL).len(), 1);
+    }
+
+    #[test]
+    fn admin_sees_notifications_for_all_admins() {
+        let state = with([
+            admin(DAVE, "Dave"),
+            created(1, ACME, 0),
+            assigned_at(1, ALICE, 5),
+            created(2, ACME, 6),
+        ]);
+        let kinds: Vec<_> = state
+            .notifications_of(DAVE)
+            .iter()
+            .map(|n| (n.ticket_id, n.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (TicketId(1), NotificationKind::NewTicket),
+                (TicketId(2), NotificationKind::NewTicket),
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_user_and_customer_have_no_inbox() {
+        let customer = UserEvent::Registered(UserRegisteredEvent {
+            user_id: UserId(60),
+            user_name: "Bob".to_owned(),
+            role: Role::Customer,
+        });
+        let state = with([customer.into(), created(1, ACME, 0)]);
+        assert_eq!(state.notifications_of(UserId(60)), []);
+        assert_eq!(state.notifications_of(UserId(99)), []);
+    }
+
+    #[test]
+    fn notifications_appear_in_changes_once() {
+        let state = with([created(1, ACME, 0), assigned_at(1, ALICE, 5)]);
+        // Регистрации — версии 1–4, создание — 5, назначение — 6.
+        let all = state.changes_since(Version(0));
+        let ids: Vec<_> = all
+            .notifications
+            .iter()
+            .map(|n| n.notification_id.0)
+            .collect();
+        assert_eq!(ids, [1, 2]);
+
+        let after_creation = state.changes_since(Version(5));
+        assert_eq!(after_creation.notifications.len(), 1);
+        assert_eq!(after_creation.notifications[0].version, Version(6));
+        assert_eq!(state.changes_since(Version(6)).notifications, []);
+    }
+
+    #[test]
+    fn reassignment_yields_two_notifications_of_one_version() {
+        let state = with([
+            created(1, ACME, 0),
+            assigned(1, ALICE, None),
+            assigned(1, CAROL, Some(ALICE)),
+        ]);
+        let changes = state.changes_since(Version(6));
+        let recipients: Vec<_> = changes.notifications.iter().map(|n| n.recipient).collect();
+        assert_eq!(
+            recipients,
+            [Recipient::Agent(CAROL), Recipient::Agent(ALICE)]
+        );
+    }
+
+    #[test]
+    fn failed_event_adds_no_notifications() {
+        let mut state = with([]);
+        let event = Envelope {
+            version: state.version().next(),
+            event: assigned(1, ALICE, None),
+        };
+        assert!(state.apply(&event).is_err());
+        assert_eq!(state.changes_since(Version(0)).notifications, []);
     }
 
     #[test]

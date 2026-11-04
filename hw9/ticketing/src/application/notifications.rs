@@ -15,7 +15,7 @@ use crate::domain::{
 };
 
 /// Кому адресовано уведомление.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Recipient {
     Agent(UserId),
     /// Все администраторы: так адресуется то, у чего нет ответственного агента.

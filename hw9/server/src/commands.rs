@@ -2,7 +2,10 @@
 //! поэтому ошибки (404 / 409 / 422) клиент получает в ответе. При успехе ответ — версия,
 //! начиная с которой результат виден в read-модели; само состояние читается запросами.
 
-use api::{AssignAgentRequest, CommandAcceptedDto};
+use api::{
+    AssignAgentRequest, CommandAcceptedDto, CreateTenantRequest, CreateTicketRequest,
+    CreateUserRequest,
+};
 use axum::{
     Json,
     extract::{Path, State},
@@ -10,15 +13,44 @@ use axum::{
 use command::{Command, CommandError};
 use framework::cqrs::{command_bus::CommandBus, envelope::Committed};
 use ticketing::application::commands::{
-    AssignAgentCommand, CloseTicketCommand, ReopenTicketCommand,
+    AssignAgentCommand, CloseTicketCommand, CreateTicketCommand, RegisterTenantCommand,
+    RegisterUserCommand, ReopenTicketCommand,
 };
 use ticketing::domain::{
     DomainEvent,
+    tenant::TenantId,
     ticket::{CloseReason, TicketId},
     user::UserId,
 };
 
-use crate::{ApiResult, Shared};
+use crate::{ApiResult, Shared, dto};
+
+pub async fn create_tenant(
+    State(state): Shared,
+    Json(request): Json<CreateTenantRequest>,
+) -> ApiResult<CommandAcceptedDto> {
+    send(&state, RegisterTenantCommand::new(request.tenant_name)).await
+}
+
+pub async fn create_user(
+    State(state): Shared,
+    Json(request): Json<CreateUserRequest>,
+) -> ApiResult<CommandAcceptedDto> {
+    let command = RegisterUserCommand::new(request.user_name, dto::role(request.role));
+    send(&state, command).await
+}
+
+pub async fn create_ticket(
+    State(state): Shared,
+    Json(request): Json<CreateTicketRequest>,
+) -> ApiResult<CommandAcceptedDto> {
+    let command = CreateTicketCommand::new(
+        request.category,
+        request.description,
+        TenantId(request.tenant_id),
+    );
+    send(&state, command).await
+}
 
 pub async fn open_ticket(
     State(state): Shared,

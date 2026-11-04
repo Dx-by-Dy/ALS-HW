@@ -13,6 +13,8 @@ pub enum TicketError {
     NotFound,
     /// Описание проблемы не может быть пустым.
     EmptyDescription,
+    /// Категория не может быть пустой.
+    EmptyCategory,
     /// Назначить на тикет можно только пользователя с ролью `Agent`.
     NotAnAgent { user_id: UserId, role: Role },
     /// Этот агент уже назначен на тикет.
@@ -35,6 +37,7 @@ impl fmt::Display for TicketError {
             Self::AlreadyExists(id) => write!(f, "{id} already exists"),
             Self::NotFound => write!(f, "ticket does not exist"),
             Self::EmptyDescription => write!(f, "ticket description must not be empty"),
+            Self::EmptyCategory => write!(f, "ticket category must not be empty"),
             Self::NotAnAgent { user_id, role } => {
                 write!(
                     f,

@@ -78,9 +78,13 @@ impl Ticket {
         if description.is_empty() {
             return Err(TicketError::EmptyDescription);
         }
+        let category = category.trim();
+        if category.is_empty() {
+            return Err(TicketError::EmptyCategory);
+        }
         Ok(TicketEvent::Created(TicketCreatedEvent {
             ticket_id,
-            category: category.trim().to_owned(),
+            category: category.to_owned(),
             description: description.to_owned(),
             tenant_id,
             at,
@@ -377,6 +381,21 @@ mod tests {
         assert_eq!(
             None::<Ticket>.decide(&command),
             Err(TicketError::EmptyDescription)
+        );
+    }
+
+    #[test]
+    fn blank_category_is_rejected() {
+        let command = TicketCommand::Create {
+            ticket_id: TicketId(1),
+            category: "  ".to_owned(),
+            description: "Problem description".to_owned(),
+            tenant_id: TenantId(1),
+            at: T0,
+        };
+        assert_eq!(
+            None::<Ticket>.decide(&command),
+            Err(TicketError::EmptyCategory)
         );
     }
 

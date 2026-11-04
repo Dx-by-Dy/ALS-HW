@@ -108,6 +108,10 @@ pub mod fixtures {
             tenant_id: 1,
             created_at: 0,
             closed_at: None,
+            close_reason: None,
+            last_activity: 0,
+            closes_at: None,
+            reminders_sent: 0,
         }
     }
 

@@ -53,7 +53,11 @@ fn status_of(e: &ServiceError) -> StatusCode {
         | ServiceError::Tenant(TenantError::NotFound)
         | ServiceError::UnknownTenant(_)
         | ServiceError::UnknownUser(_) => StatusCode::NOT_FOUND,
-        ServiceError::Ticket(TicketError::NotAnAgent { .. } | TicketError::EmptyDescription)
+        ServiceError::Ticket(
+            TicketError::NotAnAgent { .. }
+            | TicketError::EmptyDescription
+            | TicketError::EmptyCategory,
+        )
         | ServiceError::Tenant(TenantError::EmptyName)
         | ServiceError::User(UserError::EmptyName) => StatusCode::UNPROCESSABLE_ENTITY,
         ServiceError::Ticket(_) | ServiceError::Tenant(_) | ServiceError::User(_) => {

@@ -2,7 +2,7 @@
 
 use std::convert::Infallible;
 
-use api::{ChangesDto, TenantDto, TicketDto, UserDto};
+use api::{ChangesDto, NotificationDto, TenantDto, TicketDto, UserDto};
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -103,6 +103,14 @@ pub async fn get_tenant(State(state): Shared, Path(id): Path<usize>) -> ApiResul
 pub async fn list_users(State(state): Shared) -> Json<Vec<UserDto>> {
     let users = ask(&state, queries::ListUsers).await;
     Json(users.iter().map(dto::user_dto).collect())
+}
+
+pub async fn notifications_of(
+    State(state): Shared,
+    Path(id): Path<usize>,
+) -> Json<Vec<NotificationDto>> {
+    let notifications = ask(&state, queries::NotificationsOf(UserId(id))).await;
+    Json(notifications.iter().map(dto::notification_dto).collect())
 }
 
 #[derive(Debug, Deserialize)]

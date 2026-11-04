@@ -7,24 +7,29 @@ use ticketing::application::clock::SystemClock;
 use tower_http::services::ServeDir;
 
 const DEFAULT_PORT: u16 = 3000;
-const USAGE: &str = "usage: server [--port <PORT>]";
+const USAGE: &str = "usage: server [--port <PORT>] [--seed]";
 /// Сюда `trunk build` складывает собранный клиент.
 const CLIENT_DIST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../client/dist");
 
 /// Что просили в командной строке.
 #[derive(Debug, PartialEq, Eq)]
 enum Cli {
-    Run { port: u16 },
+    Run { port: u16, seed: bool },
     Help,
 }
 
-/// `server [--port <PORT>]`; порт также можно задать как `--port=<PORT>`.
+/// `server [--port <PORT>] [--seed]`; порт также можно задать как `--port=<PORT>`.
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
     let mut port = DEFAULT_PORT;
+    let mut seed = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let value = match arg.as_str() {
             "-h" | "--help" => return Ok(Cli::Help),
+            "--seed" => {
+                seed = true;
+                continue;
+            }
             "-p" | "--port" => args.next().ok_or("--port needs a value")?,
             _ => match arg.strip_prefix("--port=") {
                 Some(value) => value.to_owned(),
@@ -35,16 +40,16 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
             .parse()
             .map_err(|_| format!("invalid port '{value}', expected a number 0-65535"))?;
     }
-    Ok(Cli::Run { port })
+    Ok(Cli::Run { port, seed })
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let port = match parse_args(std::env::args().skip(1)) {
-        Ok(Cli::Run { port }) => port,
+    let (port, with_seed) = match parse_args(std::env::args().skip(1)) {
+        Ok(Cli::Run { port, seed }) => (port, seed),
         Ok(Cli::Help) => {
             println!(
-                "{USAGE}\n\nServes the ticket API and the web client on 127.0.0.1 (default port {DEFAULT_PORT})."
+                "{USAGE}\n\nServes the ticket API and the web client on 127.0.0.1 (default port {DEFAULT_PORT}).\nThe system starts empty; --seed fills it with demo data."
             );
             return ExitCode::SUCCESS;
         }
@@ -53,7 +58,7 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match run(port).await {
+    match run(port, with_seed).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
@@ -62,16 +67,18 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(port: u16, with_seed: bool) -> Result<(), Box<dyn std::error::Error>> {
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| format!("cannot listen on {addr}: {e}"))?;
 
     let app = app(SystemClock, Config::default());
-    seed(&app.commands).await?;
+    if with_seed {
+        seed(&app.commands).await?;
+    }
     if !Path::new(CLIENT_DIST).join("index.html").exists() {
-        eprintln!("warning: client is not built, run `trunk build` in hw8/client");
+        eprintln!("warning: client is not built, run `trunk build` in hw9/client");
     }
     let router = app.router.fallback_service(ServeDir::new(CLIENT_DIST));
 
@@ -91,14 +98,32 @@ mod tests {
 
     #[test]
     fn port_defaults_to_3000() {
-        assert_eq!(parse(&[]), Ok(Cli::Run { port: 3000 }));
+        assert_eq!(
+            parse(&[]),
+            Ok(Cli::Run {
+                port: 3000,
+                seed: false
+            })
+        );
     }
 
     #[test]
     fn port_is_taken_from_arguments() {
-        assert_eq!(parse(&["--port", "8000"]), Ok(Cli::Run { port: 8000 }));
-        assert_eq!(parse(&["-p", "8001"]), Ok(Cli::Run { port: 8001 }));
-        assert_eq!(parse(&["--port=0"]), Ok(Cli::Run { port: 0 }));
+        let run = |port| Cli::Run { port, seed: false };
+        assert_eq!(parse(&["--port", "8000"]), Ok(run(8000)));
+        assert_eq!(parse(&["-p", "8001"]), Ok(run(8001)));
+        assert_eq!(parse(&["--port=0"]), Ok(run(0)));
+    }
+
+    #[test]
+    fn seed_is_off_unless_asked_for() {
+        assert_eq!(
+            parse(&["--seed", "--port", "8000"]),
+            Ok(Cli::Run {
+                port: 8000,
+                seed: true
+            })
+        );
     }
 
     #[test]

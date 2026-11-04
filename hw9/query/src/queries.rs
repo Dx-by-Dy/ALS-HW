@@ -8,7 +8,7 @@ use ticketing::domain::{
     user::UserId,
 };
 
-use crate::views::{Changes, TenantView, TicketView, UserView};
+use crate::views::{Changes, NotificationView, TenantView, TicketView, UserView};
 
 /// Тикет по номеру.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +47,11 @@ pub struct ListTenants;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListUsers;
 
+/// Входящие уведомления пользователя, от старых к новым: агенту — адресованные ему,
+/// администратору — адресованные всем администраторам. У остальных входящих нет.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotificationsOf(pub UserId);
+
 /// Записи, изменённые после версии. `ChangesSince(Version(0))` — всё состояние целиком.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChangesSince(pub Version);
@@ -81,6 +86,10 @@ impl Query for ListTenants {
 
 impl Query for ListUsers {
     type Output = Vec<UserView>;
+}
+
+impl Query for NotificationsOf {
+    type Output = Vec<NotificationView>;
 }
 
 impl Query for ChangesSince {

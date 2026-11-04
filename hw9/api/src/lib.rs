@@ -4,7 +4,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-// Команды: POST, ответ — `CommandAcceptedDto`.
+// Команды: POST, ответ — `CommandAcceptedDto`. Создание идёт POST-запросом на адрес списка:
+// `TENANTS` с `CreateTenantRequest`, `USERS` с `CreateUserRequest`, `TICKETS` с `CreateTicketRequest`.
 
 pub fn open_ticket(ticket_id: usize) -> String {
     format!("/api/tickets/{ticket_id}/open")
@@ -31,6 +32,11 @@ pub fn ticket(ticket_id: usize) -> String {
 
 pub fn tenant(tenant_id: usize) -> String {
     format!("/api/tenants/{tenant_id}")
+}
+
+/// Входящие уведомления пользователя, от старых к новым.
+pub fn notifications_of(user_id: usize) -> String {
+    format!("/api/users/{user_id}/notifications")
 }
 
 /// Незакрытые тикеты, назначенные на агента.
@@ -94,6 +100,49 @@ impl fmt::Display for Role {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CloseReason {
+    /// Проблема решена.
+    Resolved,
+    /// Истёк срок неактивности.
+    Inactivity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReminderKind {
+    /// Тикет простаивает.
+    Stale,
+    /// Скоро тикет закроется сам.
+    ClosingSoon,
+}
+
+/// Кому адресовано уведомление.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Recipient {
+    Agent(usize),
+    Admins,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotificationKind {
+    NewTicket,
+    Reopened,
+    Assigned,
+    Unassigned,
+    Reminder(ReminderKind),
+    Closed(CloseReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationDto {
+    pub notification_id: usize,
+    pub recipient: Recipient,
+    pub ticket_id: usize,
+    pub kind: NotificationKind,
+    /// Время в секундах Unix-времени.
+    pub at: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketDto {
     pub ticket_id: usize,
@@ -106,6 +155,14 @@ pub struct TicketDto {
     pub created_at: u64,
     /// Время закрытия в секундах Unix-времени; `None`, пока тикет открыт.
     pub closed_at: Option<u64>,
+    /// Почему тикет закрыли; `None`, пока он открыт.
+    pub close_reason: Option<CloseReason>,
+    /// Последняя активность в секундах Unix-времени: от неё считаются сроки.
+    pub last_activity: u64,
+    /// Когда тикет закроется сам, если активности не будет; `None`, если он закрыт.
+    pub closes_at: Option<u64>,
+    /// Сколько напоминаний отправлено с момента последней активности.
+    pub reminders_sent: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +178,24 @@ pub struct TenantDto {
     pub tenant_name: String,
     pub discount_percent: u8,
     pub open_tickets: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateTenantRequest {
+    pub tenant_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateUserRequest {
+    pub user_name: String,
+    pub role: Role,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateTicketRequest {
+    pub category: String,
+    pub description: String,
+    pub tenant_id: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +231,8 @@ pub struct ChangesDto {
     pub tickets: Vec<TicketDto>,
     pub tenants: Vec<TenantDto>,
     pub users: Vec<UserDto>,
+    /// Новые уведомления всех получателей, от старых к новым; каждое приходит один раз.
+    pub notifications: Vec<NotificationDto>,
 }
 
 impl ChangesDto {

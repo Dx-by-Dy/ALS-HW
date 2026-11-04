@@ -1,7 +1,11 @@
 //! Перевод моделей представления в DTO контракта `api` и обратно.
 
-use api::{ChangesDto, Role, TenantDto, TicketDto, TicketStatus, UserDto};
-use query::views::{Changes, TenantView, TicketView, UserView};
+use api::{
+    ChangesDto, CloseReason, NotificationDto, NotificationKind, Recipient, ReminderKind, Role,
+    TenantDto, TicketDto, TicketStatus, UserDto,
+};
+use query::views::{Changes, NotificationView, TenantView, TicketView, UserView};
+use ticketing::application::notifications;
 use ticketing::domain::{ticket, user};
 
 pub fn ticket_dto(ticket: &TicketView) -> TicketDto {
@@ -18,6 +22,48 @@ pub fn ticket_dto(ticket: &TicketView) -> TicketDto {
         tenant_id: ticket.tenant_id.0,
         created_at: ticket.created_at.0,
         closed_at: ticket.closed_at.map(|at| at.0),
+        close_reason: ticket.close_reason.map(close_reason),
+        last_activity: ticket.last_activity.0,
+        closes_at: ticket.closes_at().map(|at| at.0),
+        reminders_sent: ticket.reminders_sent,
+    }
+}
+
+fn close_reason(reason: ticket::CloseReason) -> CloseReason {
+    match reason {
+        ticket::CloseReason::Resolved => CloseReason::Resolved,
+        ticket::CloseReason::Inactivity => CloseReason::Inactivity,
+    }
+}
+
+fn reminder_kind(kind: ticket::ReminderKind) -> ReminderKind {
+    match kind {
+        ticket::ReminderKind::Stale => ReminderKind::Stale,
+        ticket::ReminderKind::ClosingSoon => ReminderKind::ClosingSoon,
+    }
+}
+
+pub fn notification_dto(notification: &NotificationView) -> NotificationDto {
+    NotificationDto {
+        notification_id: notification.notification_id.0,
+        recipient: match notification.recipient {
+            notifications::Recipient::Agent(id) => Recipient::Agent(id.0),
+            notifications::Recipient::Admins => Recipient::Admins,
+        },
+        ticket_id: notification.ticket_id.0,
+        kind: match notification.kind {
+            notifications::NotificationKind::NewTicket => NotificationKind::NewTicket,
+            notifications::NotificationKind::Reopened => NotificationKind::Reopened,
+            notifications::NotificationKind::Assigned => NotificationKind::Assigned,
+            notifications::NotificationKind::Unassigned => NotificationKind::Unassigned,
+            notifications::NotificationKind::Reminder(kind) => {
+                NotificationKind::Reminder(reminder_kind(kind))
+            }
+            notifications::NotificationKind::Closed(reason) => {
+                NotificationKind::Closed(close_reason(reason))
+            }
+        },
+        at: notification.at.0,
     }
 }
 
@@ -26,6 +72,14 @@ pub fn ticket_status(status: TicketStatus) -> ticket::TicketStatus {
         TicketStatus::Open => ticket::TicketStatus::Open,
         TicketStatus::InProgress => ticket::TicketStatus::InProgress,
         TicketStatus::Closed => ticket::TicketStatus::Closed,
+    }
+}
+
+pub fn role(role: Role) -> user::Role {
+    match role {
+        Role::Customer => user::Role::Customer,
+        Role::Agent => user::Role::Agent,
+        Role::Admin => user::Role::Admin,
     }
 }
 
@@ -58,5 +112,6 @@ pub fn changes_dto(epoch: u64, full: bool, changes: &Changes) -> ChangesDto {
         tickets: changes.tickets.iter().map(ticket_dto).collect(),
         tenants: changes.tenants.iter().map(tenant_dto).collect(),
         users: changes.users.iter().map(user_dto).collect(),
+        notifications: changes.notifications.iter().map(notification_dto).collect(),
     }
 }
