@@ -1,0 +1,9 @@
+[package]
+name = "framework"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
