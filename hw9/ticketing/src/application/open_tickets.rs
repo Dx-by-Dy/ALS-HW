@@ -1,40 +1,38 @@
 use std::collections::HashMap;
 
-use crate::domain::{
-    tenant::TenantId,
-    ticket::{TicketEvent, TicketId},
-};
+use crate::domain::{tenant::TenantId, ticket::TicketEvent};
 
 /// Проекция открытых тикетов, построенная только из событий тикетов.
 ///
-/// Отвечает на вопрос, который неудобно задавать отдельным агрегатам:
-/// сколько открытых тикетов у тенанта.
+/// Отвечает на вопрос, который неудобно задавать отдельным агрегатам: сколько открытых тикетов
+/// у тенанта. Хранит только счётчики, потому что спрашивают об этом при каждом пересчёте скидки,
+/// а перебор всех тикетов рос бы вместе с системой. Каждое событие применяется один раз: их
+/// порядок и единственность гарантирует запись в стрим, после которой вызывается `project`.
 #[derive(Debug, Default)]
 pub struct OpenTickets {
-    tickets: HashMap<TicketId, TenantId>,
+    by_tenant: HashMap<TenantId, usize>,
 }
 
 impl OpenTickets {
     pub fn project(&mut self, event: &TicketEvent) {
         match event {
-            TicketEvent::Created(e) => {
-                self.tickets.insert(e.ticket_id, e.tenant_id);
-            }
+            TicketEvent::Created(e) => self.opened(e.tenant_id),
+            TicketEvent::Reopened(e) => self.opened(e.tenant_id),
             TicketEvent::Closed(e) => {
-                self.tickets.remove(&e.ticket_id);
-            }
-            TicketEvent::Reopened(e) => {
-                self.tickets.insert(e.ticket_id, e.tenant_id);
+                if let Some(count) = self.by_tenant.get_mut(&e.tenant_id) {
+                    *count = count.saturating_sub(1);
+                }
             }
             TicketEvent::AgentAssigned(_) | TicketEvent::ReminderSent(_) => {}
         }
     }
 
     pub fn count_for_tenant(&self, tenant_id: TenantId) -> usize {
-        self.tickets
-            .values()
-            .filter(|tenant| **tenant == tenant_id)
-            .count()
+        self.by_tenant.get(&tenant_id).copied().unwrap_or(0)
+    }
+
+    fn opened(&mut self, tenant_id: TenantId) {
+        *self.by_tenant.entry(tenant_id).or_default() += 1;
     }
 }
 
@@ -44,7 +42,7 @@ mod tests {
     use crate::domain::{
         ticket::{
             AgentAssignedEvent, CloseReason, ReminderKind, ReminderSentEvent, TicketClosedEvent,
-            TicketCreatedEvent, TicketReopenedEvent,
+            TicketCreatedEvent, TicketId, TicketReopenedEvent,
         },
         time::Timestamp,
         user::UserId,
