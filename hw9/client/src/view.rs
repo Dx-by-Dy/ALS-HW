@@ -3,9 +3,9 @@
 
 use std::time::Duration;
 
-use leptos::{prelude::*, task::spawn_local};
+use leptos::{ev::SubmitEvent, prelude::*, task::spawn_local};
 
-use api::{TicketDto, TicketStatus};
+use api::{NotificationDto, Role, TicketDto, TicketStatus};
 
 use crate::model::http::BrowserHttpClient;
 use crate::model::ticket_api::TicketQuery;
@@ -15,6 +15,8 @@ type Vm = TicketViewModel<BrowserHttpClient>;
 
 /// Сколько дней показывает запрос закрытых тикетов, пока пользователь не ввёл своё.
 const DEFAULT_CLOSED_DAYS: u64 = 7;
+
+const ROLES: [Role; 3] = [Role::Agent, Role::Admin, Role::Customer];
 
 #[component]
 pub fn TicketView(vm: Vm) -> impl IntoView {
@@ -35,9 +37,13 @@ pub fn TicketView(vm: Vm) -> impl IntoView {
                 </span>
             </header>
             <TenantBar vm />
+            <CreationPanel vm />
             <div class="layout">
                 <TicketList vm />
-                <TicketDetails vm />
+                <div class="side">
+                    <TicketDetails vm />
+                    <NotificationPanel vm />
+                </div>
             </div>
             <QueryPanel vm />
         </main>
@@ -69,6 +75,135 @@ fn TenantBar(vm: Vm) -> impl IntoView {
     }
 }
 
+/// Формы создания: сервер может стартовать пустым, и всё заводится отсюда.
+#[component]
+fn CreationPanel(vm: Vm) -> impl IntoView {
+    let forms = vm.forms;
+    view! {
+        <details class="panel creation" open>
+            <summary>"Create"</summary>
+            <div class="creation-forms">
+                <form on:submit=move |ev| submit(ev, async move { vm.create_tenant().await })>
+                    <h3>"Tenant"</h3>
+                    <label>"Name" <input bind:value=forms.tenant_name /></label>
+                    <button type="submit" disabled=move || !vm.can_create_tenant()>
+                        "Create tenant"
+                    </button>
+                </form>
+                <form on:submit=move |ev| submit(ev, async move { vm.create_user().await })>
+                    <h3>"User"</h3>
+                    <label>"Name" <input bind:value=forms.user_name /></label>
+                    <label>
+                        "Role"
+                        <select on:change=move |ev| {
+                            let value = event_target_value(&ev);
+                            if let Some(role) = ROLES.into_iter().find(|r| r.to_string() == value) {
+                                forms.user_role.set(role);
+                            }
+                        }>
+                            {ROLES
+                                .into_iter()
+                                .map(|role| {
+                                    view! {
+                                        <option selected=move || forms.user_role.get() == role>
+                                            {role.to_string()}
+                                        </option>
+                                    }
+                                })
+                                .collect_view()}
+                        </select>
+                    </label>
+                    <button type="submit" disabled=move || !vm.can_create_user()>
+                        "Create user"
+                    </button>
+                </form>
+                <form on:submit=move |ev| submit(ev, async move { vm.create_ticket().await })>
+                    <h3>"Ticket"</h3>
+                    <label>
+                        "Tenant"
+                        <select on:change=move |ev| {
+                            forms.ticket_tenant.set(event_target_value(&ev).parse().ok());
+                        }>
+                            <option value="">"Choose a tenant"</option>
+                            {move || {
+                                vm.tenants()
+                                    .into_iter()
+                                    .map(|tenant| {
+                                        let id = tenant.tenant_id;
+                                        view! {
+                                            <option
+                                                value=id.to_string()
+                                                selected=move || forms.ticket_tenant.get() == Some(id)
+                                            >
+                                                {tenant.tenant_name}
+                                            </option>
+                                        }
+                                    })
+                                    .collect_view()
+                            }}
+                        </select>
+                    </label>
+                    <label>"Category" <input bind:value=forms.ticket_category /></label>
+                    <label>"Description" <input bind:value=forms.ticket_description /></label>
+                    <button type="submit" disabled=move || !vm.can_create_ticket()>
+                        "Create ticket"
+                    </button>
+                </form>
+            </div>
+            <p class="error" role="alert">{move || vm.creation_error()}</p>
+        </details>
+    }
+}
+
+/// Входящие уведомления выбранного пользователя. Выбор — не вход в систему: авторизации нет.
+#[component]
+fn NotificationPanel(vm: Vm) -> impl IntoView {
+    view! {
+        <section class="panel notifications">
+            <div class="assign">
+                <label for="viewer">"Notifications for"</label>
+                <select
+                    id="viewer"
+                    on:change=move |ev| vm.view_as(event_target_value(&ev).parse().ok())
+                >
+                    <option value="">"Choose a user"</option>
+                    {user_options(vm, move || vm.viewer_id())}
+                </select>
+            </div>
+            {move || {
+                let notifications = vm.notifications();
+                if vm.viewer_id().is_none() {
+                    view! { <p class="empty">"Choose a user to see their notifications"</p> }.into_any()
+                } else if notifications.is_empty() {
+                    view! { <p class="empty">"No notifications"</p> }.into_any()
+                } else {
+                    view! {
+                        <ul>
+                            {notifications
+                                .into_iter()
+                                .map(|notification| notification_row(vm, notification))
+                                .collect_view()}
+                        </ul>
+                    }
+                    .into_any()
+                }
+            }}
+        </section>
+    }
+}
+
+fn notification_row(vm: Vm, notification: NotificationDto) -> impl IntoView {
+    let ticket_id = notification.ticket_id;
+    view! {
+        <li>
+            <button type="button" on:click=move |_| vm.select_ticket(ticket_id)>
+                <span>{format!("ticket-{ticket_id}: {}", notification.kind)}</span>
+                <time>{format_utc(notification.at)}</time>
+            </button>
+        </li>
+    }
+}
+
 #[component]
 fn TicketList(vm: Vm) -> impl IntoView {
     view! {
@@ -90,6 +225,7 @@ fn TicketList(vm: Vm) -> impl IntoView {
                     }}
                 </tbody>
             </table>
+            {move || vm.list_hint().map(|hint| view! { <p class="empty list-hint">{hint}</p> })}
         </section>
     }
 }
@@ -142,22 +278,7 @@ fn TicketDetails(vm: Vm) -> impl IntoView {
                         }
                     >
                         <option value="">"Choose a user"</option>
-                        {move || {
-                            vm.users()
-                                .into_iter()
-                                .map(|user| {
-                                    let id = user.user_id;
-                                    view! {
-                                        <option
-                                            value=id.to_string()
-                                            selected=move || vm.selected_user_id() == Some(id)
-                                        >
-                                            {format!("{} ({})", user.user_name, user.role)}
-                                        </option>
-                                    }
-                                })
-                                .collect_view()
-                        }}
+                        {user_options(vm, move || vm.selected_user_id())}
                     </select>
                     <button
                         on:click=move |_| spawn_local(async move { vm.assign_agent().await })
@@ -189,8 +310,16 @@ fn ticket_card(vm: Vm, ticket: TicketDto) -> impl IntoView {
                 <dd>{agent_name(vm, ticket.assigned_agent)}</dd>
                 <dt>"Created"</dt>
                 <dd>{format_utc(ticket.created_at)}</dd>
+                <dt>"Last activity"</dt>
+                <dd>{format_utc(ticket.last_activity)}</dd>
+                <dt>"Closes by itself"</dt>
+                <dd>{optional_time(ticket.closes_at)}</dd>
+                <dt>"Reminders sent"</dt>
+                <dd>{ticket.reminders_sent}</dd>
                 <dt>"Closed"</dt>
-                <dd>{ticket.closed_at.map_or_else(|| "—".to_owned(), format_utc)}</dd>
+                <dd>{optional_time(ticket.closed_at)}</dd>
+                <dt>"Close reason"</dt>
+                <dd>{ticket.close_reason.map_or_else(|| "—".to_owned(), |reason| reason.to_string())}</dd>
             </dl>
         </div>
     }
@@ -315,7 +444,7 @@ fn query_results(vm: Vm, tickets: Vec<TicketDto>) -> impl IntoView {
                                 <td>{ticket.description}</td>
                                 <td>{status_badge(ticket.status)}</td>
                                 <td>{agent_name(vm, ticket.assigned_agent)}</td>
-                                <td>{ticket.closed_at.map_or_else(|| "—".to_owned(), format_utc)}</td>
+                                <td>{optional_time(ticket.closed_at)}</td>
                             </tr>
                         }
                     })
@@ -333,6 +462,36 @@ fn status_badge(status: TicketStatus) -> impl IntoView {
         TicketStatus::Closed => "badge closed",
     };
     view! { <span class=class>{status.to_string()}</span> }
+}
+
+/// Варианты выпадающего списка пользователей; `selected` говорит, какой из них выбран.
+fn user_options(
+    vm: Vm,
+    selected: impl Fn() -> Option<usize> + Copy + Send + Sync + 'static,
+) -> impl IntoView {
+    move || {
+        vm.users()
+            .into_iter()
+            .map(|user| {
+                let id = user.user_id;
+                view! {
+                    <option value=id.to_string() selected=move || selected() == Some(id)>
+                        {format!("{} ({})", user.user_name, user.role)}
+                    </option>
+                }
+            })
+            .collect_view()
+    }
+}
+
+fn optional_time(secs: Option<u64>) -> String {
+    secs.map_or_else(|| "—".to_owned(), format_utc)
+}
+
+/// Отправка формы: браузеру перезагружать страницу не нужно, команду выполняет модель.
+fn submit(event: SubmitEvent, command: impl Future<Output = ()> + 'static) {
+    event.prevent_default();
+    spawn_local(command);
 }
 
 fn agent_name(vm: Vm, agent: Option<usize>) -> String {

@@ -108,12 +108,32 @@ pub enum CloseReason {
     Inactivity,
 }
 
+impl fmt::Display for CloseReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Resolved => "resolved",
+            Self::Inactivity => "inactivity",
+        };
+        f.write_str(name)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReminderKind {
     /// Тикет простаивает.
     Stale,
     /// Скоро тикет закроется сам.
     ClosingSoon,
+}
+
+impl fmt::Display for ReminderKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Stale => "stale",
+            Self::ClosingSoon => "closing soon",
+        };
+        f.write_str(name)
+    }
 }
 
 /// Кому адресовано уведомление.
@@ -131,6 +151,19 @@ pub enum NotificationKind {
     Unassigned,
     Reminder(ReminderKind),
     Closed(CloseReason),
+}
+
+impl fmt::Display for NotificationKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NewTicket => f.write_str("new ticket needs an agent"),
+            Self::Reopened => f.write_str("reopened and needs an agent"),
+            Self::Assigned => f.write_str("assigned to you"),
+            Self::Unassigned => f.write_str("reassigned to another agent"),
+            Self::Reminder(kind) => write!(f, "reminder: {kind}"),
+            Self::Closed(reason) => write!(f, "closed: {reason}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,4 +281,23 @@ impl ChangesDto {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorDto {
     pub error: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notification_kinds_read_as_text() {
+        let text = |kind: NotificationKind| kind.to_string();
+        assert_eq!(text(NotificationKind::Assigned), "assigned to you");
+        assert_eq!(
+            text(NotificationKind::Reminder(ReminderKind::ClosingSoon)),
+            "reminder: closing soon"
+        );
+        assert_eq!(
+            text(NotificationKind::Closed(CloseReason::Inactivity)),
+            "closed: inactivity"
+        );
+    }
 }

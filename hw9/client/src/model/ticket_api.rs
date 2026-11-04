@@ -6,8 +6,10 @@ use std::error::Error;
 use std::fmt;
 
 use api::{
-    AssignAgentRequest, ChangesDto, CommandAcceptedDto, Cursor, ErrorDto, TicketDto, UserDto,
+    AssignAgentRequest, ChangesDto, CommandAcceptedDto, CreateTenantRequest, CreateTicketRequest,
+    CreateUserRequest, Cursor, ErrorDto, TicketDto, UserDto,
 };
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::http::{HttpClient, HttpRequest, TransportError};
@@ -111,8 +113,36 @@ impl<H: HttpClient> TicketApiService<H> {
         let body = AssignAgentRequest {
             agent_id: agent.user_id,
         };
-        let body = serde_json::to_string(&body).expect("request serializes to JSON");
-        let path = api::assign_agent(ticket.ticket_id);
+        self.post(api::assign_agent(ticket.ticket_id), &body).await
+    }
+
+    pub async fn create_tenant(
+        &self,
+        request: &CreateTenantRequest,
+    ) -> Result<CommandAcceptedDto, ApiError> {
+        self.post(api::TENANTS, request).await
+    }
+
+    pub async fn create_user(
+        &self,
+        request: &CreateUserRequest,
+    ) -> Result<CommandAcceptedDto, ApiError> {
+        self.post(api::USERS, request).await
+    }
+
+    pub async fn create_ticket(
+        &self,
+        request: &CreateTicketRequest,
+    ) -> Result<CommandAcceptedDto, ApiError> {
+        self.post(api::TICKETS, request).await
+    }
+
+    async fn post(
+        &self,
+        path: impl Into<String>,
+        body: &impl Serialize,
+    ) -> Result<CommandAcceptedDto, ApiError> {
+        let body = serde_json::to_string(body).expect("request serializes to JSON");
         self.request(HttpRequest::post(path, Some(body))).await
     }
 
@@ -263,6 +293,50 @@ mod tests {
         assert_eq!(request.method, Method::Post);
         assert_eq!(request.path, "/api/tickets/2/assign");
         assert_eq!(request.body.as_deref(), Some(r#"{"agent_id":5}"#));
+    }
+
+    #[test]
+    fn creation_posts_to_collections() {
+        let (service, http) = service();
+        for version in 1..=3 {
+            http.respond_json(200, &accepted(version));
+        }
+
+        let tenant = crate::model::new_tenant("Acme").unwrap();
+        assert_eq!(block_on(service.create_tenant(&tenant)), Ok(accepted(1)));
+        let user = crate::model::new_user("Alice", Role::Agent).unwrap();
+        assert_eq!(block_on(service.create_user(&user)), Ok(accepted(2)));
+        let new_ticket = crate::model::new_ticket("Billing", "Refund", Some(1)).unwrap();
+        assert_eq!(
+            block_on(service.create_ticket(&new_ticket)),
+            Ok(accepted(3))
+        );
+
+        let sent: Vec<_> = http
+            .requests()
+            .into_iter()
+            .map(|r| (r.method, r.path, r.body.unwrap()))
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                (
+                    Method::Post,
+                    "/api/tenants".to_owned(),
+                    r#"{"tenant_name":"Acme"}"#.to_owned()
+                ),
+                (
+                    Method::Post,
+                    "/api/users".to_owned(),
+                    r#"{"user_name":"Alice","role":"Agent"}"#.to_owned()
+                ),
+                (
+                    Method::Post,
+                    "/api/tickets".to_owned(),
+                    r#"{"category":"Billing","description":"Refund","tenant_id":1}"#.to_owned()
+                ),
+            ]
+        );
     }
 
     #[test]

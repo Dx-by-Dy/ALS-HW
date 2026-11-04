@@ -11,20 +11,51 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use api::{CommandAcceptedDto, Role, TenantDto, TicketDto, UserDto};
+use api::{
+    CommandAcceptedDto, CreateTenantRequest, CreateTicketRequest, CreateUserRequest,
+    NotificationDto, Role, TenantDto, TicketDto, UserDto,
+};
 use leptos::prelude::*;
 
-use crate::model::TicketRules;
 use crate::model::backoff::Backoff;
 use crate::model::http::HttpClient;
 use crate::model::replica::Replica;
 use crate::model::ticket_api::{ApiError, TicketApiService, TicketQuery};
+use crate::model::{self, TicketRules, ValidationError};
+
+/// Поля форм создания: представление привязывает их напрямую, а проверяет и отправляет модель.
+#[derive(Clone, Copy)]
+pub struct CreationForms {
+    pub tenant_name: RwSignal<String>,
+    pub user_name: RwSignal<String>,
+    pub user_role: RwSignal<Role>,
+    pub ticket_category: RwSignal<String>,
+    pub ticket_description: RwSignal<String>,
+    pub ticket_tenant: RwSignal<Option<usize>>,
+}
+
+impl CreationForms {
+    fn new() -> Self {
+        Self {
+            tenant_name: RwSignal::new(String::new()),
+            user_name: RwSignal::new(String::new()),
+            // Клиенты в системе пока ничего не делают, а без агента нельзя взять тикет в работу.
+            user_role: RwSignal::new(Role::Agent),
+            ticket_category: RwSignal::new(String::new()),
+            ticket_description: RwSignal::new(String::new()),
+            ticket_tenant: RwSignal::new(None),
+        }
+    }
+}
 
 pub struct TicketViewModel<H: 'static> {
+    pub forms: CreationForms,
     api: StoredValue<Arc<TicketApiService<H>>>,
     replica: RwSignal<Replica>,
     selected_ticket: RwSignal<Option<usize>>,
     selected_user: RwSignal<Option<usize>>,
+    /// Чьи уведомления показаны. Это не вход в систему: действия от него не зависят.
+    viewer: RwSignal<Option<usize>>,
     /// Команда отправлена, ответа ещё нет.
     sending: RwSignal<bool>,
     /// Версия своей последней команды, до которой копия ещё не дошла.
@@ -32,6 +63,7 @@ pub struct TicketViewModel<H: 'static> {
     /// Последний запрос изменений прошёл успешно.
     connected: RwSignal<bool>,
     error: RwSignal<Option<String>>,
+    creation_error: RwSignal<Option<String>>,
     query: RwSignal<Option<TicketQuery>>,
     query_results: RwSignal<Vec<TicketDto>>,
     query_error: RwSignal<Option<String>>,
@@ -50,14 +82,17 @@ impl<H> Copy for TicketViewModel<H> {}
 impl<H: HttpClient + Send + Sync + 'static> TicketViewModel<H> {
     pub fn new(api: TicketApiService<H>) -> Self {
         Self {
+            forms: CreationForms::new(),
             api: StoredValue::new(Arc::new(api)),
             replica: RwSignal::new(Replica::default()),
             selected_ticket: RwSignal::new(None),
             selected_user: RwSignal::new(None),
+            viewer: RwSignal::new(None),
             sending: RwSignal::new(false),
             pending: RwSignal::new(None),
             connected: RwSignal::new(false),
             error: RwSignal::new(None),
+            creation_error: RwSignal::new(None),
             query: RwSignal::new(None),
             query_results: RwSignal::new(Vec::new()),
             query_error: RwSignal::new(None),
@@ -118,6 +153,36 @@ impl<H: HttpClient + Send + Sync + 'static> TicketViewModel<H> {
         self.error.get()
     }
 
+    pub fn creation_error(&self) -> Option<String> {
+        self.creation_error.get()
+    }
+
+    pub fn viewer_id(&self) -> Option<usize> {
+        self.viewer.get()
+    }
+
+    /// Уведомления выбранного пользователя, новые сверху.
+    pub fn notifications(&self) -> Vec<NotificationDto> {
+        let Some(user_id) = self.viewer.get() else {
+            return Vec::new();
+        };
+        self.replica
+            .with(|r| r.notifications_of(user_id).copied().collect())
+    }
+
+    /// Что сделать дальше, пока показывать нечего. Сервер может стартовать пустым.
+    pub fn list_hint(&self) -> Option<&'static str> {
+        self.replica.with(|r| {
+            if r.version().is_none() || r.tickets().next().is_some() {
+                None
+            } else if r.tenants().next().is_none() {
+                Some("No tenants yet: create one to get started")
+            } else {
+                Some("No tickets yet: create the first one")
+            }
+        })
+    }
+
     pub fn user_name(&self, user_id: usize) -> Option<String> {
         self.replica
             .with(|r| r.user(user_id).map(|u| u.user_name.clone()))
@@ -148,6 +213,10 @@ impl<H: HttpClient + Send + Sync + 'static> TicketViewModel<H> {
         self.selected_user.set(user_id);
     }
 
+    pub fn view_as(&self, user_id: Option<usize>) {
+        self.viewer.set(user_id);
+    }
+
     // --- Доступность команд (CanExecute) ---
 
     pub fn can_open(&self) -> bool {
@@ -160,6 +229,43 @@ impl<H: HttpClient + Send + Sync + 'static> TicketViewModel<H> {
 
     pub fn can_assign(&self) -> bool {
         !self.is_busy() && self.assignment().is_some_and(|r| r.is_ok())
+    }
+
+    pub fn can_create_tenant(&self) -> bool {
+        !self.is_busy() && self.tenant_request().is_ok()
+    }
+
+    pub fn can_create_user(&self) -> bool {
+        !self.is_busy() && self.user_request().is_ok()
+    }
+
+    pub fn can_create_ticket(&self) -> bool {
+        !self.is_busy() && self.ticket_request().is_ok()
+    }
+
+    fn tenant_request(&self) -> Result<CreateTenantRequest, ValidationError> {
+        self.forms.tenant_name.with(|name| model::new_tenant(name))
+    }
+
+    fn user_request(&self) -> Result<CreateUserRequest, ValidationError> {
+        let role = self.forms.user_role.get();
+        self.forms
+            .user_name
+            .with(|name| model::new_user(name, role))
+    }
+
+    fn ticket_request(&self) -> Result<CreateTicketRequest, ValidationError> {
+        // После перезапуска сервера выбранного тенанта может уже не быть.
+        let tenant_id = self
+            .forms
+            .ticket_tenant
+            .get()
+            .filter(|id| self.replica.with(|r| r.tenant(*id).is_some()));
+        self.forms.ticket_category.with(|category| {
+            self.forms
+                .ticket_description
+                .with(|description| model::new_ticket(category, description, tenant_id))
+        })
     }
 
     /// Почему выбранного пользователя нельзя назначить на выбранный тикет.
@@ -238,38 +344,79 @@ impl<H: HttpClient + Send + Sync + 'static> TicketViewModel<H> {
     }
 
     // --- Команды ---
+    //
+    // Команды вызывает обработчик события, а не реактивное замыкание, поэтому состояние
+    // они читают через `untrack`: подписываться здесь не на что.
 
     pub async fn open_ticket(&self) {
-        if !self.can_open() {
-            return;
-        }
-        let Some(ticket) = self.selected() else {
+        let Some(Some(ticket)) = untrack(|| self.can_open().then(|| self.selected())) else {
             return;
         };
         let api = self.api.get_value();
-        self.run(api.open_ticket(&ticket)).await;
+        self.run(self.error, api.open_ticket(&ticket)).await;
     }
 
     pub async fn close_ticket(&self) {
-        if !self.can_close() {
-            return;
-        }
-        let Some(ticket) = self.selected() else {
+        let Some(Some(ticket)) = untrack(|| self.can_close().then(|| self.selected())) else {
             return;
         };
         let api = self.api.get_value();
-        self.run(api.close_ticket(&ticket)).await;
+        self.run(self.error, api.close_ticket(&ticket)).await;
     }
 
     pub async fn assign_agent(&self) {
-        if !self.can_assign() {
-            return;
-        }
-        let Some(Ok((ticket, agent))) = self.assignment() else {
+        let Some(Some(Ok((ticket, agent)))) =
+            untrack(|| self.can_assign().then(|| self.assignment()))
+        else {
             return;
         };
         let api = self.api.get_value();
-        self.run(api.assign_agent(&ticket, &agent)).await;
+        self.run(self.error, api.assign_agent(&ticket, &agent))
+            .await;
+    }
+
+    pub async fn create_tenant(&self) {
+        let Some(Ok(request)) = untrack(|| self.can_create_tenant().then(|| self.tenant_request()))
+        else {
+            return;
+        };
+        let api = self.api.get_value();
+        if self
+            .run(self.creation_error, api.create_tenant(&request))
+            .await
+        {
+            self.forms.tenant_name.set(String::new());
+        }
+    }
+
+    pub async fn create_user(&self) {
+        let Some(Ok(request)) = untrack(|| self.can_create_user().then(|| self.user_request()))
+        else {
+            return;
+        };
+        let api = self.api.get_value();
+        if self
+            .run(self.creation_error, api.create_user(&request))
+            .await
+        {
+            self.forms.user_name.set(String::new());
+        }
+    }
+
+    /// После успеха тенант остаётся выбранным: тикеты часто заводят подряд для одного тенанта.
+    pub async fn create_ticket(&self) {
+        let Some(Ok(request)) = untrack(|| self.can_create_ticket().then(|| self.ticket_request()))
+        else {
+            return;
+        };
+        let api = self.api.get_value();
+        if self
+            .run(self.creation_error, api.create_ticket(&request))
+            .await
+        {
+            self.forms.ticket_category.set(String::new());
+            self.forms.ticket_description.set(String::new());
+        }
     }
 
     /// Выбирает запрос в панели запросов и выполняет его.
@@ -296,10 +443,17 @@ impl<H: HttpClient + Send + Sync + 'static> TicketViewModel<H> {
         }
     }
 
-    async fn run(&self, command: impl Future<Output = Result<CommandAcceptedDto, ApiError>>) {
+    /// Отправляет команду и сообщает, принята ли она; текст отказа попадает в `error`.
+    async fn run(
+        &self,
+        error: RwSignal<Option<String>>,
+        command: impl Future<Output = Result<CommandAcceptedDto, ApiError>>,
+    ) -> bool {
         self.sending.set(true);
-        self.error.set(None);
-        match command.await {
+        error.set(None);
+        let result = command.await;
+        let accepted = result.is_ok();
+        match result {
             Ok(accepted) => {
                 let seen = self
                     .replica
@@ -308,9 +462,10 @@ impl<H: HttpClient + Send + Sync + 'static> TicketViewModel<H> {
                     self.pending.set(Some(accepted.version));
                 }
             }
-            Err(e) => self.error.set(Some(e.to_string())),
+            Err(e) => error.set(Some(e.to_string())),
         }
         self.sending.set(false);
+        accepted
     }
 }
 
@@ -319,10 +474,10 @@ mod tests {
     use futures::executor::block_on;
 
     use super::*;
-    use crate::model::fixtures::{changes, ticket, user};
+    use crate::model::fixtures::{changes, notification, ticket, user};
     use crate::model::http::HttpRequest;
     use crate::model::mock_http::MockHttpClient;
-    use api::{ChangesDto, TicketStatus};
+    use api::{ChangesDto, Recipient, TicketStatus};
 
     const EPOCH: u64 = 1;
     const LOADED: u64 = 10;
@@ -599,6 +754,214 @@ mod tests {
         http.respond_json(200, &delta(11, vec![]));
         block_on(vm.poll_once()).unwrap();
         assert_eq!(http.requests().len(), 5);
+    }
+
+    /// Модель, подключённая к пустому серверу.
+    fn empty() -> (TicketViewModel<MockHttpClient>, MockHttpClient) {
+        let http = MockHttpClient::default();
+        http.respond_json(200, &changes(EPOCH, 0, true, vec![]));
+        let vm = TicketViewModel::new(TicketApiService::new(http.clone()));
+        block_on(vm.poll_once()).unwrap();
+        (vm, http)
+    }
+
+    #[test]
+    fn empty_system_says_what_to_do_first() {
+        let vm = TicketViewModel::new(TicketApiService::new(MockHttpClient::default()));
+        assert_eq!(
+            vm.list_hint(),
+            None,
+            "nothing is known before the first poll"
+        );
+
+        let (vm, http) = empty();
+        assert_eq!(
+            vm.list_hint(),
+            Some("No tenants yet: create one to get started")
+        );
+
+        http.respond_json(
+            200,
+            &ChangesDto {
+                tenants: vec![tenant_dto(0, 0)],
+                ..delta(1, vec![])
+            },
+        );
+        block_on(vm.poll_once()).unwrap();
+        assert_eq!(vm.list_hint(), Some("No tickets yet: create the first one"));
+
+        http.respond_json(200, &delta(2, vec![ticket(1, TicketStatus::Open)]));
+        block_on(vm.poll_once()).unwrap();
+        assert_eq!(vm.list_hint(), None);
+    }
+
+    #[test]
+    fn creating_tenant_clears_form_and_waits_for_changes() {
+        let (vm, http) = empty();
+        assert!(!vm.can_create_tenant());
+
+        vm.forms.tenant_name.set("  Acme ".to_owned());
+        assert!(vm.can_create_tenant());
+        http.respond_json(200, &CommandAcceptedDto { version: 1 });
+        block_on(vm.create_tenant());
+
+        let request = last_request(&http);
+        assert_eq!(request.path, "/api/tenants");
+        assert_eq!(request.body.as_deref(), Some(r#"{"tenant_name":"Acme"}"#));
+        assert_eq!(vm.forms.tenant_name.get(), "");
+        // Тенант появится только из потока изменений, до тех пор модель занята.
+        assert!(vm.is_busy());
+        assert!(vm.tenants().is_empty());
+
+        http.respond_json(
+            200,
+            &ChangesDto {
+                tenants: vec![tenant_dto(0, 0)],
+                ..delta(1, vec![])
+            },
+        );
+        block_on(vm.poll_once()).unwrap();
+        assert!(!vm.is_busy());
+        assert_eq!(vm.tenants().len(), 1);
+    }
+
+    #[test]
+    fn creating_user_sends_chosen_role() {
+        let (vm, http) = empty();
+        vm.forms.user_name.set("Dave".to_owned());
+        vm.forms.user_role.set(Role::Admin);
+        http.respond_json(200, &CommandAcceptedDto { version: 1 });
+
+        block_on(vm.create_user());
+
+        assert_eq!(
+            last_request(&http).body.as_deref(),
+            Some(r#"{"user_name":"Dave","role":"Admin"}"#)
+        );
+        assert_eq!(vm.forms.user_name.get(), "");
+    }
+
+    #[test]
+    fn creating_ticket_needs_all_fields_and_keeps_tenant_for_the_next_one() {
+        let (vm, http) = loaded();
+        vm.forms.ticket_category.set("Billing".to_owned());
+        vm.forms.ticket_description.set("Refund".to_owned());
+        assert!(!vm.can_create_ticket(), "tenant is not chosen");
+
+        vm.forms.ticket_tenant.set(Some(1));
+        assert!(vm.can_create_ticket());
+        http.respond_json(200, &CommandAcceptedDto { version: 11 });
+        block_on(vm.create_ticket());
+
+        assert_eq!(
+            last_request(&http).body.as_deref(),
+            Some(r#"{"category":"Billing","description":"Refund","tenant_id":1}"#)
+        );
+        assert_eq!(vm.forms.ticket_category.get(), "");
+        assert_eq!(vm.forms.ticket_description.get(), "");
+        assert_eq!(vm.forms.ticket_tenant.get(), Some(1));
+    }
+
+    #[test]
+    fn ticket_cannot_be_created_for_tenant_lost_on_restart() {
+        let (vm, http) = loaded();
+        vm.forms.ticket_category.set("Billing".to_owned());
+        vm.forms.ticket_description.set("Refund".to_owned());
+        vm.forms.ticket_tenant.set(Some(1));
+        assert!(vm.can_create_ticket());
+
+        http.respond_json(200, &changes(EPOCH + 1, 0, true, vec![]));
+        block_on(vm.poll_once()).unwrap();
+
+        assert!(!vm.can_create_ticket());
+    }
+
+    #[test]
+    fn rejected_creation_keeps_input_and_shows_error_in_its_own_place() {
+        let (vm, http) = loaded();
+        vm.forms.tenant_name.set("Acme".to_owned());
+        http.respond_error(422, "tenant name must not be empty");
+
+        block_on(vm.create_tenant());
+
+        assert_eq!(vm.forms.tenant_name.get(), "Acme");
+        assert_eq!(
+            vm.creation_error().as_deref(),
+            Some("server rejected the request (422): tenant name must not be empty")
+        );
+        assert_eq!(vm.error(), None);
+        assert!(!vm.is_busy());
+
+        // Следующая удачная попытка убирает ошибку.
+        http.respond_json(200, &CommandAcceptedDto { version: LOADED });
+        block_on(vm.create_tenant());
+        assert_eq!(vm.creation_error(), None);
+    }
+
+    #[test]
+    fn unavailable_creation_sends_nothing() {
+        let (vm, http) = loaded();
+        block_on(vm.create_tenant());
+        block_on(vm.create_user());
+        block_on(vm.create_ticket());
+
+        // Пока идёт другая команда, заполненная форма тоже ждёт.
+        vm.forms.tenant_name.set("Acme".to_owned());
+        vm.pending.set(Some(LOADED + 1));
+        assert!(!vm.can_create_tenant());
+        block_on(vm.create_tenant());
+
+        assert_eq!(http.requests().len(), 1);
+        assert_eq!(vm.forms.tenant_name.get(), "Acme");
+    }
+
+    #[test]
+    fn notifications_belong_to_chosen_user_and_arrive_by_polling() {
+        let (vm, http) = loaded();
+        assert!(vm.notifications().is_empty(), "nobody is chosen");
+
+        http.respond_json(
+            200,
+            &ChangesDto {
+                notifications: vec![
+                    notification(1, Recipient::Agent(1)),
+                    notification(2, Recipient::Admins),
+                ],
+                ..delta(11, vec![])
+            },
+        );
+        block_on(vm.poll_once()).unwrap();
+        assert!(vm.notifications().is_empty());
+
+        vm.view_as(Some(1));
+        assert_eq!(vm.viewer_id(), Some(1));
+        let inbox = vm.notifications();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].notification_id, 1);
+
+        vm.view_as(Some(2));
+        assert!(vm.notifications().is_empty(), "customers have no inbox");
+
+        // Выбор пользователя не запрашивает ничего: всё уже пришло через long polling.
+        assert_eq!(http.requests().len(), 2);
+    }
+
+    #[test]
+    fn notifications_alone_do_not_rerun_query() {
+        let (vm, http) = loaded();
+        http.respond_json(200, &Vec::<TicketDto>::new());
+        block_on(vm.run_query(TicketQuery::ClosedWithin(7)));
+
+        http.respond_json(
+            200,
+            &ChangesDto {
+                notifications: vec![notification(1, Recipient::Admins)],
+                ..delta(11, vec![])
+            },
+        );
+        block_on(vm.poll_once()).unwrap();
+
+        assert_eq!(http.requests().len(), 3);
     }
 
     #[test]

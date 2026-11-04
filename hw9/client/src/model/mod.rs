@@ -15,7 +15,10 @@ pub mod ticket_api;
 use std::error::Error;
 use std::fmt;
 
-use api::{Role, TicketDto, TicketStatus, UserDto};
+use api::{
+    CreateTenantRequest, CreateTicketRequest, CreateUserRequest, Role, TicketDto, TicketStatus,
+    UserDto,
+};
 
 /// Правила допустимости команд над тикетом. Данные модели — DTO из `api`, а правила
 /// клиент добавляет к ним сам: по ним ViewModel решает, доступна ли команда.
@@ -63,6 +66,42 @@ impl TicketRules for TicketDto {
     }
 }
 
+/// Запрос на создание тенанта из того, что ввёл пользователь.
+pub fn new_tenant(name: &str) -> Result<CreateTenantRequest, ValidationError> {
+    Ok(CreateTenantRequest {
+        tenant_name: required("tenant name", name)?,
+    })
+}
+
+/// Запрос на создание пользователя из того, что ввёл пользователь.
+pub fn new_user(name: &str, role: Role) -> Result<CreateUserRequest, ValidationError> {
+    Ok(CreateUserRequest {
+        user_name: required("user name", name)?,
+        role,
+    })
+}
+
+/// Запрос на создание тикета из того, что ввёл пользователь.
+pub fn new_ticket(
+    category: &str,
+    description: &str,
+    tenant_id: Option<usize>,
+) -> Result<CreateTicketRequest, ValidationError> {
+    Ok(CreateTicketRequest {
+        category: required("ticket category", category)?,
+        description: required("ticket description", description)?,
+        tenant_id: tenant_id.ok_or(ValidationError::TenantNotChosen)?,
+    })
+}
+
+fn required(field: &'static str, value: &str) -> Result<String, ValidationError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ValidationError::Blank(field));
+    }
+    Ok(value.to_owned())
+}
+
 /// Команда недопустима при текущем состоянии модели.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
@@ -70,6 +109,8 @@ pub enum ValidationError {
     AlreadyClosed(usize),
     NotAnAgent { user_name: String, role: Role },
     AlreadyAssigned { user_name: String, ticket_id: usize },
+    Blank(&'static str),
+    TenantNotChosen,
 }
 
 impl fmt::Display for ValidationError {
@@ -87,6 +128,8 @@ impl fmt::Display for ValidationError {
                 user_name,
                 ticket_id,
             } => write!(f, "{user_name} is already assigned to ticket-{ticket_id}"),
+            Self::Blank(field) => write!(f, "{field} must not be empty"),
+            Self::TenantNotChosen => f.write_str("choose a tenant for the ticket"),
         }
     }
 }
@@ -96,7 +139,17 @@ impl Error for ValidationError {}
 #[cfg(test)]
 pub mod fixtures {
     use super::*;
-    use api::ChangesDto;
+    use api::{ChangesDto, NotificationDto, NotificationKind, Recipient};
+
+    pub fn notification(id: usize, recipient: Recipient) -> NotificationDto {
+        NotificationDto {
+            notification_id: id,
+            recipient,
+            ticket_id: 1,
+            kind: NotificationKind::Assigned,
+            at: 0,
+        }
+    }
 
     pub fn ticket(id: usize, status: TicketStatus) -> TicketDto {
         TicketDto {
@@ -174,6 +227,50 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn creation_requests_keep_trimmed_text() {
+        assert_eq!(new_tenant("  Acme ").unwrap().tenant_name, "Acme");
+        assert_eq!(
+            new_user(" Alice ", Role::Agent),
+            Ok(CreateUserRequest {
+                user_name: "Alice".to_owned(),
+                role: Role::Agent
+            })
+        );
+        assert_eq!(
+            new_ticket(" Billing ", " Wrong invoice ", Some(3)),
+            Ok(CreateTicketRequest {
+                category: "Billing".to_owned(),
+                description: "Wrong invoice".to_owned(),
+                tenant_id: 3
+            })
+        );
+    }
+
+    #[test]
+    fn blank_text_or_missing_tenant_is_not_a_request() {
+        assert_eq!(
+            new_tenant("   "),
+            Err(ValidationError::Blank("tenant name"))
+        );
+        assert_eq!(
+            new_user("", Role::Agent),
+            Err(ValidationError::Blank("user name"))
+        );
+        assert_eq!(
+            new_ticket(" ", "text", Some(1)),
+            Err(ValidationError::Blank("ticket category"))
+        );
+        assert_eq!(
+            new_ticket("Billing", " ", Some(1)),
+            Err(ValidationError::Blank("ticket description"))
+        );
+        assert_eq!(
+            new_ticket("Billing", "text", None),
+            Err(ValidationError::TenantNotChosen)
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use api::{ChangesDto, Cursor, TenantDto, TicketDto, UserDto};
+use api::{ChangesDto, Cursor, NotificationDto, Recipient, Role, TenantDto, TicketDto, UserDto};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Replica {
@@ -12,6 +12,7 @@ pub struct Replica {
     tickets: BTreeMap<usize, TicketDto>,
     tenants: BTreeMap<usize, TenantDto>,
     users: BTreeMap<usize, UserDto>,
+    notifications: BTreeMap<usize, NotificationDto>,
 }
 
 impl Replica {
@@ -23,6 +24,7 @@ impl Replica {
             self.tickets.clear();
             self.tenants.clear();
             self.users.clear();
+            self.notifications.clear();
         }
         for ticket in changes.tickets {
             self.tickets.insert(ticket.ticket_id, ticket);
@@ -32,6 +34,10 @@ impl Replica {
         }
         for user in changes.users {
             self.users.insert(user.user_id, user);
+        }
+        for notification in changes.notifications {
+            self.notifications
+                .insert(notification.notification_id, notification);
         }
     }
 
@@ -72,16 +78,91 @@ impl Replica {
     pub fn user(&self, user_id: usize) -> Option<&UserDto> {
         self.users.get(&user_id)
     }
+
+    /// Входящие пользователя, новые сверху. Сервер шлёт уведомления всех получателей,
+    /// поэтому отбор здесь: у агента они личные, у админов общие, у клиентов их нет.
+    pub fn notifications_of(&self, user_id: usize) -> impl Iterator<Item = &NotificationDto> {
+        let recipient = self.user(user_id).and_then(|user| match user.role {
+            Role::Agent => Some(Recipient::Agent(user_id)),
+            Role::Admin => Some(Recipient::Admins),
+            Role::Customer => None,
+        });
+        self.notifications
+            .values()
+            .rev()
+            .filter(move |n| Some(n.recipient) == recipient)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::fixtures::{changes, ticket, user};
-    use api::{Role, TicketStatus};
+    use crate::model::fixtures::{changes, notification, ticket, user};
+    use api::TicketStatus;
 
     fn ids(replica: &Replica) -> Vec<usize> {
         replica.tickets().map(|t| t.ticket_id).collect()
+    }
+
+    fn inbox(replica: &Replica, user_id: usize) -> Vec<usize> {
+        replica
+            .notifications_of(user_id)
+            .map(|n| n.notification_id)
+            .collect()
+    }
+
+    fn with_inboxes() -> Replica {
+        let mut replica = Replica::default();
+        replica.apply(ChangesDto {
+            users: vec![
+                user(1, "Alice", Role::Agent),
+                user(2, "Carol", Role::Agent),
+                user(3, "Dave", Role::Admin),
+                user(4, "Bob", Role::Customer),
+            ],
+            notifications: vec![
+                notification(1, Recipient::Admins),
+                notification(2, Recipient::Agent(1)),
+                notification(3, Recipient::Agent(2)),
+            ],
+            ..changes(1, 10, true, vec![])
+        });
+        replica
+    }
+
+    #[test]
+    fn inbox_holds_only_what_is_addressed_to_the_user() {
+        let replica = with_inboxes();
+        assert_eq!(inbox(&replica, 1), [2]);
+        assert_eq!(inbox(&replica, 2), [3]);
+        assert_eq!(inbox(&replica, 3), [1]);
+        assert!(inbox(&replica, 4).is_empty());
+        assert!(inbox(&replica, 99).is_empty());
+    }
+
+    #[test]
+    fn delta_adds_notifications_newest_first() {
+        let mut replica = with_inboxes();
+        let delta = |id| ChangesDto {
+            notifications: vec![notification(id, Recipient::Agent(1))],
+            ..changes(1, 11, false, vec![])
+        };
+        replica.apply(delta(4));
+        assert_eq!(inbox(&replica, 1), [4, 2]);
+
+        // Повторная доставка того же уведомления не удваивает его.
+        replica.apply(delta(4));
+        assert_eq!(inbox(&replica, 1), [4, 2]);
+    }
+
+    #[test]
+    fn full_answer_replaces_notifications() {
+        let mut replica = with_inboxes();
+        replica.apply(ChangesDto {
+            users: vec![user(1, "Alice", Role::Agent)],
+            ..changes(2, 1, true, vec![])
+        });
+        assert!(inbox(&replica, 1).is_empty());
     }
 
     #[test]
