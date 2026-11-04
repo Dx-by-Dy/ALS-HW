@@ -200,6 +200,15 @@ mod tests {
         })
     }
 
+    /// Всё, что наступило к `now`.
+    fn fire_due(manager: &mut Manager, now: &Timestamp) -> Vec<LifecycleCommand> {
+        let mut commands = Vec::new();
+        while let Some(fired) = manager.fire_next(now) {
+            commands.extend(fired);
+        }
+        commands
+    }
+
     fn manager_with(events: impl IntoIterator<Item = DomainEvent>) -> Manager {
         let mut manager = Manager::default();
         for event in events {
@@ -228,7 +237,7 @@ mod tests {
         assert!(!manager.is_running(&T1));
         assert_eq!(manager.deadlines_of(&T1), []);
         assert_eq!(manager.next_deadline(), None);
-        assert_eq!(manager.fire_due(&day(100)), []);
+        assert_eq!(fire_due(&mut manager, &day(100)), []);
     }
 
     #[test]
@@ -236,23 +245,26 @@ mod tests {
         let mut manager = manager_with([created(T1, day(0))]);
         let before = |d: u64| Timestamp(d * DAY - 1);
 
-        assert_eq!(manager.fire_due(&before(3)), []);
-        assert_eq!(manager.fire_due(&day(3)), [remind(T1, ReminderKind::Stale)]);
-        assert_eq!(manager.fire_due(&before(9)), []);
+        assert_eq!(fire_due(&mut manager, &before(3)), []);
         assert_eq!(
-            manager.fire_due(&day(9)),
+            fire_due(&mut manager, &day(3)),
+            [remind(T1, ReminderKind::Stale)]
+        );
+        assert_eq!(fire_due(&mut manager, &before(9)), []);
+        assert_eq!(
+            fire_due(&mut manager, &day(9)),
             [remind(T1, ReminderKind::ClosingSoon)]
         );
-        assert_eq!(manager.fire_due(&before(10)), []);
-        assert_eq!(manager.fire_due(&day(10)), [auto_close(T1)]);
-        assert_eq!(manager.fire_due(&day(100)), []);
+        assert_eq!(fire_due(&mut manager, &before(10)), []);
+        assert_eq!(fire_due(&mut manager, &day(10)), [auto_close(T1)]);
+        assert_eq!(fire_due(&mut manager, &day(100)), []);
     }
 
     #[test]
     fn overdue_deadlines_are_sent_in_order() {
         let mut manager = manager_with([created(T1, day(0))]);
         assert_eq!(
-            manager.fire_due(&day(50)),
+            fire_due(&mut manager, &day(50)),
             [
                 remind(T1, ReminderKind::Stale),
                 remind(T1, ReminderKind::ClosingSoon),
@@ -272,17 +284,20 @@ mod tests {
                 (TicketDeadline::AutoClose, day(12)),
             ]
         );
-        assert_eq!(manager.fire_due(&day(4)), []);
+        assert_eq!(fire_due(&mut manager, &day(4)), []);
     }
 
     #[test]
     fn assignment_after_reminder_brings_it_back() {
         let mut manager = manager_with([created(T1, day(0))]);
-        manager.fire_due(&day(3));
+        fire_due(&mut manager, &day(3));
         assert_eq!(manager.deadlines_of(&T1).len(), 2);
 
         assert_eq!(manager.on_event(&assigned(T1, day(4))), []);
-        assert_eq!(manager.fire_due(&day(7)), [remind(T1, ReminderKind::Stale)]);
+        assert_eq!(
+            fire_due(&mut manager, &day(7)),
+            [remind(T1, ReminderKind::Stale)]
+        );
     }
 
     #[test]
@@ -304,7 +319,10 @@ mod tests {
     #[test]
     fn auto_close_waits_for_the_event_before_finishing() {
         let mut manager = manager_with([created(T1, day(0))]);
-        assert_eq!(manager.fire_due(&day(10)).last(), Some(&auto_close(T1)));
+        assert_eq!(
+            fire_due(&mut manager, &day(10)).last(),
+            Some(&auto_close(T1))
+        );
         assert!(manager.is_running(&T1));
         assert_eq!(manager.on_event(&closed(T1, day(10))), []);
         assert!(!manager.is_running(&T1));
@@ -313,12 +331,12 @@ mod tests {
     #[test]
     fn activity_after_rejected_auto_close_keeps_process_going() {
         let mut manager = manager_with([created(T1, day(0))]);
-        manager.fire_due(&day(10));
+        fire_due(&mut manager, &day(10));
         // Агент назначен раньше, чем команда дошла до агрегата: тот её отклонит, а сага узнает
         // об активности из потока событий и назначит новые сроки.
         assert_eq!(manager.on_event(&assigned(T1, day(10))), []);
-        assert_eq!(manager.fire_due(&day(19)).len(), 2);
-        assert_eq!(manager.fire_due(&day(20)), [auto_close(T1)]);
+        assert_eq!(fire_due(&mut manager, &day(19)).len(), 2);
+        assert_eq!(fire_due(&mut manager, &day(20)), [auto_close(T1)]);
     }
 
     #[test]
@@ -344,7 +362,10 @@ mod tests {
         let mut manager =
             manager_with([created(T1, day(0)), created(T2, day(1)), closed(T1, day(1))]);
         assert!(manager.is_running(&T2));
-        assert_eq!(manager.fire_due(&day(4)), [remind(T2, ReminderKind::Stale)]);
+        assert_eq!(
+            fire_due(&mut manager, &day(4)),
+            [remind(T2, ReminderKind::Stale)]
+        );
     }
 
     #[test]
@@ -401,7 +422,7 @@ mod tests {
         async fn advance(&mut self, secs: u64) -> Vec<DomainEvent> {
             self.clock.advance(secs);
             self.drain_events();
-            for command in self.manager.fire_due(&self.clock.now()) {
+            for command in fire_due(&mut self.manager, &self.clock.now()) {
                 let result = match command {
                     LifecycleCommand::SendReminder(c) => self.service.handle_send_reminder(c).await,
                     LifecycleCommand::CloseTicket(c) => self.service.handle_close_ticket(c).await,
@@ -545,7 +566,7 @@ mod tests {
         process.clock.advance(10 * DAY);
 
         // Дедлайн уже сработал, но агент назначен раньше, чем команда дошла до агрегата.
-        let commands = process.manager.fire_due(&day(10));
+        let commands = fire_due(&mut process.manager, &day(10));
         assert_eq!(commands.last(), Some(&auto_close(T1)));
         process
             .service

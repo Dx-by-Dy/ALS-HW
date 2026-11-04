@@ -1,6 +1,9 @@
-use ticketing::application::commands::{
-    ApplyDiscountCommand, AssignAgentCommand, CloseTicketCommand, CreateTicketCommand,
-    RegisterTenantCommand, RegisterUserCommand, ReopenTicketCommand, SendReminderCommand,
+use ticketing::application::{
+    commands::{
+        ApplyDiscountCommand, AssignAgentCommand, CloseTicketCommand, CreateTicketCommand,
+        RegisterTenantCommand, RegisterUserCommand, ReopenTicketCommand, SendReminderCommand,
+    },
+    ticket_lifecycle::LifecycleCommand,
 };
 
 /// Любая команда, которую принимает командная сторона.
@@ -14,8 +17,15 @@ pub enum Command {
     ReopenTicket(ReopenTicketCommand),
     SendReminder(SendReminderCommand),
     ApplyDiscount(ApplyDiscountCommand),
-    /// Закрыть все тикеты, у которых истёк таймаут неактивности.
-    CloseInactiveTickets,
+}
+
+impl From<LifecycleCommand> for Command {
+    fn from(command: LifecycleCommand) -> Self {
+        match command {
+            LifecycleCommand::SendReminder(c) => Self::SendReminder(c),
+            LifecycleCommand::CloseTicket(c) => Self::CloseTicket(c),
+        }
+    }
 }
 
 macro_rules! impl_from_command {

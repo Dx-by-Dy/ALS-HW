@@ -12,7 +12,7 @@ use super::{
 use crate::domain::{
     DomainEvent,
     tenant::{Tenant, TenantCommand, TenantEvent, TenantId},
-    ticket::{CloseReason, Ticket, TicketCommand, TicketEvent, TicketId},
+    ticket::{Ticket, TicketCommand, TicketEvent, TicketId},
     user::{User, UserCommand, UserEvent, UserId},
 };
 use framework::event_sourcing::aggregate::Aggregate;
@@ -168,20 +168,6 @@ impl<C: Clock> TicketService<C> {
         self.execute_ticket(command.ticket_id, remind).await
     }
 
-    /// Закрывает все тикеты, простоявшие без активности дольше таймаута.
-    pub async fn close_inactive_tickets(&mut self) -> Result<Vec<TicketEvent>, ServiceError> {
-        let now = self.clock.now();
-        let mut events = Vec::new();
-        for ticket_id in self.open_tickets.inactive_at(now) {
-            let command = TicketCommand::Close {
-                reason: CloseReason::Inactivity,
-                at: now,
-            };
-            events.push(self.execute_ticket(ticket_id, command).await?);
-        }
-        Ok(events)
-    }
-
     /// Пересчитывает скидку тенанта по текущему числу его открытых тикетов.
     pub async fn handle_apply_discount(
         &mut self,
@@ -264,9 +250,9 @@ mod tests {
     use crate::domain::{
         tenant::{DiscountAppliedEvent, DiscountRate, TenantError},
         ticket::{
-            AgentAssignedEvent, INACTIVITY_TIMEOUT_SECS, ReminderKind, ReminderSentEvent,
-            STALE_REMINDER_AFTER_SECS, TicketClosedEvent, TicketCreatedEvent, TicketError,
-            TicketReopenedEvent, TicketStatus,
+            AgentAssignedEvent, CloseReason, INACTIVITY_TIMEOUT_SECS, ReminderKind,
+            ReminderSentEvent, STALE_REMINDER_AFTER_SECS, TicketClosedEvent, TicketCreatedEvent,
+            TicketError, TicketReopenedEvent, TicketStatus,
         },
         time::Timestamp,
         user::Role,
@@ -552,47 +538,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inactive_tickets_are_closed_automatically() {
-        let mut f = fixture().await;
-        let stale = f.create_ticket().await;
-        let touched = f.create_ticket().await;
-        f.clock.advance(3 * DAY);
-        f.assign(touched, f.agent_id).await.unwrap();
-        f.clock.advance(INACTIVITY_TIMEOUT_SECS - 3 * DAY);
-
-        assert_eq!(
-            f.service.close_inactive_tickets().await,
-            Ok(vec![TicketEvent::Closed(TicketClosedEvent {
-                ticket_id: stale,
-                tenant_id: f.tenant_id,
-                agent_id: None,
-                reason: CloseReason::Inactivity,
-                at: Timestamp(INACTIVITY_TIMEOUT_SECS),
-            })])
-        );
-        assert_eq!(f.status(stale).await, TicketStatus::Closed);
-        assert_eq!(f.status(touched).await, TicketStatus::InProgress);
-
-        f.clock.advance(3 * DAY);
-        let closed: Vec<_> = f
-            .service
-            .close_inactive_tickets()
-            .await
-            .unwrap()
-            .iter()
-            .map(TicketEvent::ticket_id)
-            .collect();
-        assert_eq!(closed, [touched]);
-    }
-
-    #[tokio::test]
-    async fn nothing_to_close_when_all_tickets_are_active() {
-        let mut f = fixture().await;
-        f.create_ticket().await;
-        assert_eq!(f.service.close_inactive_tickets().await, Ok(vec![]));
-    }
-
-    #[tokio::test]
     async fn discount_follows_number_of_open_tickets() {
         let mut f = fixture().await;
         let mut tickets = Vec::new();
@@ -767,7 +712,11 @@ mod tests {
 
         f.clock
             .advance(INACTIVITY_TIMEOUT_SECS - STALE_REMINDER_AFTER_SECS);
-        assert_eq!(f.service.close_inactive_tickets().await.unwrap().len(), 1);
+        let close = CloseTicketCommand {
+            ticket_id,
+            reason: CloseReason::Inactivity,
+        };
+        assert!(f.service.handle_close_ticket(close).await.is_ok());
     }
 
     #[tokio::test]

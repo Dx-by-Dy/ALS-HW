@@ -73,7 +73,6 @@ impl<C: Clock> CommandActor<C> {
             Command::ReopenTicket(c) => service.handle_reopen_ticket(c).await.map(drop),
             Command::SendReminder(c) => service.handle_send_reminder(c).await.map(drop),
             Command::ApplyDiscount(c) => service.handle_apply_discount(c).await.map(drop),
-            Command::CloseInactiveTickets => service.close_inactive_tickets().await.map(drop),
         }
     }
 
@@ -128,8 +127,8 @@ mod tests {
     use ticketing::domain::{
         tenant::TenantId,
         ticket::{
-            CloseReason, INACTIVITY_TIMEOUT_SECS, ReminderKind, STALE_REMINDER_AFTER_SECS,
-            TicketError, TicketEvent, TicketId,
+            CloseReason, ReminderKind, STALE_REMINDER_AFTER_SECS, TicketError, TicketEvent,
+            TicketId,
         },
         user::{Role, UserId},
     };
@@ -179,37 +178,6 @@ mod tests {
         );
         let committed = bus.send(ticket(TenantId(1))).await.unwrap();
         assert_eq!(committed.version, Version(3));
-    }
-
-    #[tokio::test]
-    async fn command_that_writes_nothing_reports_current_version() {
-        let (bus, _) = bus_with_tenant().await;
-        let committed = bus.send(Command::CloseInactiveTickets).await.unwrap();
-        assert_eq!(
-            committed,
-            Committed {
-                version: Version(2),
-                events: vec![],
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn closing_inactive_tickets_publishes_each_closed_ticket() {
-        let (bus, clock) = bus_with_tenant().await;
-        for _ in 0..2 {
-            bus.send(ticket(TenantId(1))).await.unwrap();
-        }
-        clock.advance(INACTIVITY_TIMEOUT_SECS);
-
-        let committed = bus.send(Command::CloseInactiveTickets).await.unwrap();
-        assert_eq!(committed.version, Version(6));
-        assert_eq!(versions(&committed), [5, 6]);
-        assert!(committed.events.iter().all(|e| matches!(
-            e.event,
-            DomainEvent::Ticket(TicketEvent::Closed(ref closed))
-                if closed.reason == CloseReason::Inactivity
-        )));
     }
 
     #[tokio::test]

@@ -32,7 +32,9 @@ use ticketing::application::{
 use ticketing::domain::{
     DomainEvent,
     tenant::{DiscountRate, TenantError, TenantId},
-    ticket::{CloseReason, INACTIVITY_TIMEOUT_SECS, TicketId, TicketStatus},
+    ticket::{
+        CloseReason, INACTIVITY_TIMEOUT_SECS, STALE_REMINDER_AFTER_SECS, TicketId, TicketStatus,
+    },
     time::Timestamp,
     user::{Role, UserId},
 };
@@ -112,17 +114,35 @@ async fn late_projection_catches_up_from_history() {
 }
 
 #[tokio::test]
-async fn closing_inactive_tickets_reaches_read_model() {
+async fn saga_reminders_and_auto_close_reach_read_model() {
     let clock = ManualClock::default();
     let bus = command::spawn(TicketService::new(clock.clone()));
     let model = start_projection(&bus);
+    tokio::spawn(command::run_ticket_lifecycle(
+        bus.clone(),
+        clock.clone(),
+        Duration::from_millis(1),
+        |e| panic!("the saga command was rejected: {e}"),
+    ));
     acme_with_alice(&bus).await;
     create_ticket(&bus).await;
     create_ticket(&bus).await;
-    clock.advance(INACTIVITY_TIMEOUT_SECS);
+    clock.advance(STALE_REMINDER_AFTER_SECS);
 
-    let version = send(&bus, Command::CloseInactiveTickets).await;
-    model.wait_until(version).await;
+    // Версии 3 и 4 — создание, 5 и 6 — напоминания.
+    tokio::time::timeout(Duration::from_secs(5), model.wait_until(Version(6)))
+        .await
+        .unwrap();
+    let Ok(ticket) = model.handle(GetTicket(TicketId(1))).await;
+    let ticket = ticket.unwrap();
+    assert_eq!(ticket.reminders_sent, 1);
+    assert_eq!(ticket.status, TicketStatus::Open);
+
+    clock.advance(INACTIVITY_TIMEOUT_SECS - STALE_REMINDER_AFTER_SECS);
+    // Ещё два напоминания и два закрытия.
+    tokio::time::timeout(Duration::from_secs(5), model.wait_until(Version(10)))
+        .await
+        .unwrap();
     let Ok(closed) = model.handle(TicketsClosedSince(Timestamp(0))).await;
     assert_eq!(closed.len(), 2);
     let Ok(acme) = model.handle(GetTenant(ACME)).await;

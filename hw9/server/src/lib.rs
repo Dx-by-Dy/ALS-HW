@@ -1,8 +1,8 @@
 //! HTTP-адаптер над CQRS: команды уходят в актор командной стороны, запросы читают read-модель.
 //!
 //! [`app`] собирает систему целиком. Кроме актора, в отдельных задачах tokio работают
-//! проекция (события → read-модель), политика скидок (события → команды) и расписание,
-//! которое закрывает неактивные тикеты. Клиенты узнают об изменениях через long polling
+//! проекция (события → read-модель), политика скидок (события → команды) и оркестратор
+//! жизненного цикла тикетов с напоминаниями и автозакрытием. Клиенты узнают об изменениях через long polling
 //! `GET /api/changes?since=N`.
 
 mod commands;
@@ -19,7 +19,7 @@ use axum::{
     extract::State,
     routing::{get, post},
 };
-use command::{Command, CommandActorHandle, CommandError};
+use command::{CommandActorHandle, CommandError};
 use framework::cqrs::{
     envelope::Version,
     runner::{run_policy, run_projection},
@@ -29,7 +29,7 @@ use ticketing::application::{
     clock::Clock, discount_policy::DiscountPolicy, error::ServiceError,
     ticket_service::TicketService,
 };
-use ticketing::domain::{DomainEvent, tenant::TenantError};
+use ticketing::domain::{DomainEvent, tenant::TenantError, ticket::TicketError};
 
 pub use error::ApiError;
 pub use seed::seed;
@@ -41,15 +41,15 @@ type Shared = State<Arc<AppState>>;
 pub struct Config {
     /// Сколько long polling держит запрос, если изменений нет.
     pub long_poll: Duration,
-    /// Как часто проверять тикеты на неактивность.
-    pub close_inactive_every: Duration,
+    /// Как часто проверять, не наступили ли дедлайны тикетов.
+    pub deadline_tick: Duration,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             long_poll: Duration::from_secs(25),
-            close_inactive_every: Duration::from_secs(60),
+            deadline_tick: Duration::from_secs(1),
         }
     }
 }
@@ -71,18 +71,14 @@ struct AppState {
     epoch: u64,
 }
 
-/// Запускает командную сторону, проекцию, политику скидок и расписание в задачах tokio
+/// Запускает командную сторону, проекцию, политику скидок и оркестратор в задачах tokio
 /// и возвращает роутер над ними. Должна вызываться внутри рантайма tokio.
 pub fn app<C: Clock + Clone + Send + Sync + 'static>(clock: C, config: Config) -> App {
     let commands = command::spawn(TicketService::new(clock.clone()));
     let read_model = ReadModel::default();
     spawn_projection(&commands, &read_model);
     spawn_discount_policy(&commands);
-    tokio::spawn(command::repeat(
-        commands.clone(),
-        config.close_inactive_every,
-        Command::CloseInactiveTickets,
-    ));
+    spawn_ticket_lifecycle(&commands, clock.clone(), config.deadline_tick);
 
     let state = Arc::new(AppState {
         commands: commands.clone(),
@@ -151,6 +147,38 @@ fn spawn_discount_policy(commands: &CommandActorHandle) {
     });
 }
 
+fn spawn_ticket_lifecycle<C>(commands: &CommandActorHandle, clock: C, tick: Duration)
+where
+    C: Clock + Send + 'static,
+{
+    let bus = commands.clone();
+    tokio::spawn(async move {
+        let result = command::run_ticket_lifecycle(bus, clock, tick, |e| {
+            if !is_outdated_deadline(&e) {
+                eprintln!("warning: ticket lifecycle command failed: {e}");
+            }
+        })
+        .await;
+        if let Err(e) = result {
+            eprintln!("error: ticket lifecycle stopped: {e}");
+        }
+    });
+}
+
+/// Дедлайн устарел, пока команда шла к агрегату: в тикете появилась активность,
+/// его уже закрыли или напоминание больше не нужно. Это обычный исход, а не сбой.
+fn is_outdated_deadline(e: &CommandError) -> bool {
+    matches!(
+        e,
+        CommandError::Rejected(ServiceError::Ticket(
+            TicketError::Closed(_)
+                | TicketError::StillActive { .. }
+                | TicketError::ReminderNotDue { .. }
+                | TicketError::ReminderAlreadySent(_)
+        ))
+    )
+}
+
 /// Скидка осталась прежней — обычный исход пересчёта, а не сбой.
 fn is_discount_unchanged(e: &CommandError) -> bool {
     matches!(
@@ -173,6 +201,7 @@ mod tests {
     use http_body_util::BodyExt;
     use serde::de::DeserializeOwned;
     use ticketing::application::clock::ManualClock;
+    use ticketing::domain::ticket::INACTIVITY_TIMEOUT_SECS;
     use tower::ServiceExt;
 
     /// Номера тикетов и пользователей из [`seed`].
@@ -197,11 +226,15 @@ mod tests {
     }
 
     async fn settled_app(long_poll: Duration) -> TestApp {
-        let clock = ManualClock::default();
         let config = Config {
             long_poll,
-            close_inactive_every: Duration::from_secs(3600),
+            deadline_tick: Duration::from_secs(3600),
         };
+        settled_app_with(config).await
+    }
+
+    async fn settled_app_with(config: Config) -> TestApp {
+        let clock = ManualClock::default();
         let app = app(clock.clone(), config);
         seed(&app.commands).await.unwrap();
         let router = app.router;
@@ -402,6 +435,34 @@ mod tests {
         assert_eq!(ids(&last_week), [OPEN]);
         let last_month: Vec<TicketDto> = app.get(&api::tickets_closed_within(30)).await;
         assert_eq!(ids(&last_month), [CLOSED, OPEN]);
+    }
+
+    #[tokio::test]
+    async fn tickets_are_closed_by_deadline_and_discount_follows() {
+        let app = settled_app_with(Config {
+            long_poll: WAIT,
+            deadline_tick: Duration::from_millis(1),
+        })
+        .await;
+        app.clock.advance(INACTIVITY_TIMEOUT_SECS);
+
+        wait_for_tenant(&app.router, ACME, |t| {
+            t.open_tickets == 0 && t.discount_percent == 0
+        })
+        .await;
+        wait_for_tenant(&app.router, GLOBEX, |t| t.open_tickets == 0).await;
+        let closed: Vec<TicketDto> = app.get("/api/tickets?status=Closed").await;
+        assert_eq!(closed.len(), 9);
+    }
+
+    #[test]
+    fn only_outdated_deadlines_are_expected_rejections() {
+        let rejected = |e: TicketError| CommandError::Rejected(ServiceError::Ticket(e));
+        assert!(is_outdated_deadline(&rejected(TicketError::StillActive {
+            idle_secs: 0
+        })));
+        assert!(!is_outdated_deadline(&rejected(TicketError::NotFound)));
+        assert!(!is_outdated_deadline(&CommandError::Unavailable));
     }
 
     #[tokio::test]

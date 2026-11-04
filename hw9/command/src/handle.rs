@@ -102,7 +102,6 @@ pub struct EventSubscription(pub(crate) mpsc::UnboundedReceiver<Envelope<DomainE
 
 impl EventSubscription {
     /// Уже доступное событие, без ожидания.
-    #[cfg(test)]
     pub(crate) fn try_next(&mut self) -> Option<Envelope<DomainEvent>> {
         self.0.try_recv().ok()
     }

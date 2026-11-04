@@ -37,19 +37,20 @@ impl<S: Saga> SagaManager<S> {
         self.apply(id, effects)
     }
 
-    /// Срабатывают все дедлайны со сроком не позже `now`, от ранних к поздним. Дедлайн, который
-    /// сага назначила по ходу и срок которого уже наступил, сработает здесь же.
-    pub fn fire_due(&mut self, now: &S::Time) -> Vec<S::Command> {
-        let mut commands = Vec::new();
-        while let Some((id, deadline)) = self.deadlines.pop_due(now) {
-            // Дедлайны живут не дольше экземпляра: их удаляют вместе с ним.
-            let Some(saga) = self.instances.get_mut(&id) else {
-                continue;
-            };
-            let effects = saga.on_deadline(deadline);
-            commands.extend(self.apply(id, effects));
-        }
-        commands
+    /// Срабатывает самый ранний дедлайн со сроком не позже `now` и возвращает его команды;
+    /// `None` — наступивших дедлайнов нет.
+    ///
+    /// Дедлайны отдаются по одному, чтобы между ними можно было передать саге новые события:
+    /// они могут отменить следующий дедлайн. Дедлайн, который сага назначила по ходу и срок
+    /// которого уже наступил, сработает при одном из следующих вызовов.
+    pub fn fire_next(&mut self, now: &S::Time) -> Option<Vec<S::Command>> {
+        let (id, deadline) = self.deadlines.pop_due(now)?;
+        // Дедлайны живут не дольше экземпляра: их удаляют вместе с ним.
+        let Some(saga) = self.instances.get_mut(&id) else {
+            return Some(Vec::new());
+        };
+        let effects = saga.on_deadline(deadline);
+        Some(self.apply(id, effects))
     }
 
     /// Ближайший срок, к которому что-то сработает.
@@ -171,6 +172,15 @@ mod tests {
         }
     }
 
+    /// Всё, что наступило к `now`.
+    fn fire_due(manager: &mut SagaManager<Order>, now: &u64) -> Vec<Cmd> {
+        let mut commands = Vec::new();
+        while let Some(fired) = manager.fire_next(now) {
+            commands.extend(fired);
+        }
+        commands
+    }
+
     fn manager_with(events: &[Event]) -> SagaManager<Order> {
         let mut manager = SagaManager::default();
         for event in events {
@@ -214,15 +224,15 @@ mod tests {
     #[test]
     fn nothing_fires_before_the_deadline() {
         let mut manager = manager_with(&[Event::Placed(1, 0)]);
-        assert_eq!(manager.fire_due(&2), []);
+        assert_eq!(fire_due(&mut manager, &2), []);
         assert_eq!(manager.deadlines_of(&1).len(), 2);
     }
 
     #[test]
     fn deadline_fires_at_its_time_once_and_keeps_the_others() {
         let mut manager = manager_with(&[Event::Placed(1, 0)]);
-        assert_eq!(manager.fire_due(&3), [Cmd::Remind(1)]);
-        assert_eq!(manager.fire_due(&3), []);
+        assert_eq!(fire_due(&mut manager, &3), [Cmd::Remind(1)]);
+        assert_eq!(fire_due(&mut manager, &3), []);
         assert!(manager.is_running(&1));
         assert_eq!(
             manager.deadlines_of(&1),
@@ -233,8 +243,8 @@ mod tests {
     #[test]
     fn deadline_can_schedule_the_next_one() {
         let mut manager = manager_with(&[Event::Placed(1, 0)]);
-        manager.fire_due(&3);
-        assert_eq!(manager.fire_due(&4), [Cmd::Nudge(1)]);
+        fire_due(&mut manager, &3);
+        assert_eq!(fire_due(&mut manager, &4), [Cmd::Nudge(1)]);
     }
 
     #[test]
@@ -245,7 +255,7 @@ mod tests {
         assert_eq!(manager.deadlines_of(&1), []);
 
         // Второй экземпляр не задет, а у первого больше ничего не сработает.
-        assert_eq!(manager.fire_due(&3), [Cmd::Remind(2)]);
+        assert_eq!(fire_due(&mut manager, &3), [Cmd::Remind(2)]);
     }
 
     #[test]
@@ -255,15 +265,15 @@ mod tests {
             manager.deadlines_of(&1),
             [(Alarm::Remind, 8), (Alarm::Cancel, 15)]
         );
-        assert_eq!(manager.fire_due(&7), []);
-        assert_eq!(manager.fire_due(&8), [Cmd::Remind(1)]);
+        assert_eq!(fire_due(&mut manager, &7), []);
+        assert_eq!(fire_due(&mut manager, &8), [Cmd::Remind(1)]);
     }
 
     #[test]
     fn overdue_deadlines_fire_in_order_in_one_pass() {
         let mut manager = manager_with(&[Event::Placed(1, 0)]);
         assert_eq!(
-            manager.fire_due(&100),
+            fire_due(&mut manager, &100),
             [Cmd::Remind(1), Cmd::Nudge(1), Cmd::Cancel(1)]
         );
         assert!(!manager.is_running(&1));
@@ -273,7 +283,7 @@ mod tests {
     #[test]
     fn finishing_in_a_pass_drops_its_remaining_due_deadlines() {
         let mut manager = manager_with(&[Event::Placed(1, 0), Event::Hurried(1, 1)]);
-        assert_eq!(manager.fire_due(&100), [Cmd::Cancel(1)]);
+        assert_eq!(fire_due(&mut manager, &100), [Cmd::Cancel(1)]);
         assert!(!manager.is_running(&1));
     }
 
@@ -284,6 +294,27 @@ mod tests {
         assert_eq!(
             manager.deadlines_of(&1),
             [(Alarm::Remind, 23), (Alarm::Cancel, 30)]
+        );
+    }
+
+    #[test]
+    fn deadlines_are_fired_one_at_a_time() {
+        let mut manager = manager_with(&[Event::Placed(1, 0), Event::Placed(2, 0)]);
+        assert_eq!(manager.fire_next(&2), None);
+        assert_eq!(manager.fire_next(&3), Some(vec![Cmd::Remind(1)]));
+        assert_eq!(manager.fire_next(&3), Some(vec![Cmd::Remind(2)]));
+        assert_eq!(manager.fire_next(&3), None);
+    }
+
+    #[test]
+    fn event_between_deadlines_cancels_the_next_one() {
+        let mut manager = manager_with(&[Event::Placed(1, 0), Event::Placed(2, 0)]);
+        assert_eq!(manager.fire_next(&3), Some(vec![Cmd::Remind(1)]));
+        manager.on_event(&Event::Paid(2));
+        assert_eq!(manager.fire_next(&3), None);
+        assert_eq!(
+            fire_due(&mut manager, &100),
+            [Cmd::Nudge(1), Cmd::Cancel(1)]
         );
     }
 }
