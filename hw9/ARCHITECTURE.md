@@ -1,18 +1,20 @@
-# Архитектура HW8
+# Архитектура HW9
 
 Система тикетов, разделённая по CQRS: команды меняют состояние через агрегаты на event
-sourcing, запросы читают отдельную read-модель, которую строит поток событий. Клиенты
-узнают об изменениях через long polling.
+sourcing, запросы читают отдельную read-модель, которую строит поток событий. Жизненным
+циклом тикета управляет оркестратор с дедлайнами, а на события независимо реагируют
+участники хореографии: скидки, уведомления, read-модель. Клиенты узнают об изменениях
+через long polling.
 
-Документ описывает устройство: абстрактное ядро, обе стороны CQRS, полную схему команд
-и событий и протокол между клиентом и сервером. Как запустить и где что лежит — в
+Документ описывает устройство: абстрактное ядро, обе стороны CQRS, сагу и хореографию,
+полную схему команд и событий и протокол между клиентом и сервером. Как запустить и где что лежит — в
 [README.md](README.md).
 
 - [1. Крейты и зависимости](#1-крейты-и-зависимости)
 - [2. Абстрактное ядро `framework`](#2-абстрактное-ядро-framework)
 - [3. Командная сторона](#3-командная-сторона)
 - [4. Запросная сторона](#4-запросная-сторона)
-- [5. Фоновые процессы](#5-фоновые-процессы)
+- [5. Оркестрация и хореография](#5-оркестрация-и-хореография)
 - [6. Полная схема команд и событий](#6-полная-схема-команд-и-событий)
 - [7. Взаимодействие клиента и сервера](#7-взаимодействие-клиента-и-сервера)
 - [8. Гарантии и ограничения](#8-гарантии-и-ограничения)
@@ -21,7 +23,7 @@ sourcing, запросы читают отдельную read-модель, ко
 
 ```mermaid
 flowchart BT
-    framework["framework<br/>абстрактное ядро:<br/>event sourcing + CQRS"]
+    framework["framework<br/>абстрактное ядро:<br/>event sourcing, CQRS, саги"]
     ticketing["ticketing<br/>домен и сервис приложения"]
     command["command<br/>командная сторона: актор"]
     query["query<br/>запросная сторона: read-модель"]
@@ -47,9 +49,10 @@ flowchart BT
 
 ## 2. Абстрактное ядро `framework`
 
-Три модуля: `event_sourcing` — как агрегат принимает решения и восстанавливается из
+Четыре модуля: `event_sourcing` — как агрегат принимает решения и восстанавливается из
 событий, `cqrs` — как разделены запись и чтение и как их связывает поток событий,
-`in_memory` — реализации хранилищ event sourcing. CQRS не требует event sourcing,
+`saga` — долгоживущие процессы с дедлайнами, `in_memory` — реализации хранилищ event
+sourcing. CQRS не требует event sourcing,
 поэтому это отдельные модули; в проекте они встречаются в `TicketService`.
 
 ### 2.1. `event_sourcing`
@@ -105,12 +108,29 @@ flowchart LR
 - `run_policy(source, after, policy, bus, on_error)` — на каждое событие отправляет
   предложенные политикой команды по одной и по порядку; отказы уходят в `on_error`.
 
-### 2.3. `in_memory`
+### 2.3. `saga`
+
+Сага описывает один экземпляр процесса как автомат без ввода-вывода: на вход событие или
+сработавший дедлайн, на выход эффекты. Время, очередь и отправку команд берёт на себя
+окружение, поэтому логику процесса можно проверить без таймеров.
+
+| Тип | Что делает |
+|---|---|
+| `Saga` | `id_of(event)` — к какому экземпляру относится событие; `start(event)` — запускает ли оно процесс; `on_event`, `on_deadline` — реакции. Тип времени задаёт сама сага: ядро требует только упорядоченности. |
+| `Effects<C, D, T>` | Что сделать: `command`, `schedule(name, at)`, `finish`. Чистое значение, а не вызовы. |
+| `DeadlineQueue<K, D, T>` | Дедлайны по экземплярам: `BTreeSet` по времени и `BTreeMap` по ключу. Дедлайн с тем же именем заменяет прежний, `cancel_all` снимает все дедлайны экземпляра сразу, а не ждёт их срока. |
+| `SagaManager<S>` | Экземпляры и очередь: `on_event`, `fire_next(&now)`, `next_deadline`. `fire_next` срабатывает по одному дедлайну за раз, чтобы между ними можно было разобрать новые события. |
+
+Саги не хранят себя отдельно: всё их состояние выводится из журнала, поэтому менеджер
+восстанавливается подпиской на события с начала. Ответы на отправленные команды в автомат не
+возвращаются: об исходе сообщает следующее событие.
+
+### 2.4. `in_memory`
 
 `InMemoryEventStore` (вектор событий на стрим) и `InMemorySnapshotStore` (только последний
 снапшот стрима). Методы асинхронные лишь потому, что так требуют трейты: внутри нет `await`.
 
-### 2.4. Кто что реализует
+### 2.5. Кто что реализует
 
 | Абстракция | Реализация |
 |---|---|
@@ -118,8 +138,9 @@ flowchart LR
 | `Repository` над `in_memory` | три репозитория в `TicketService` (снапшот каждые 2 события) |
 | `CommandBus<C: Into<Command>>`, `EventSource<DomainEvent>` | `command::CommandActorHandle` |
 | `Subscription<DomainEvent>` | `command::EventSubscription` (обёртка над каналом tokio — правило сирот не даёт реализовать трейт для чужого типа напрямую) |
-| `Projection<DomainEvent>`, `QueryHandler<…>` для 9 запросов | `query::ReadModel` |
-| `Policy<DomainEvent>` | `ticketing::application::discount_policy::DiscountPolicy` |
+| `Projection<DomainEvent>`, `QueryHandler<…>` для 10 запросов | `query::ReadModel` |
+| `Policy<DomainEvent>` | `ticketing::application::discount_policy::DiscountPolicy`, `ticketing::application::notifications::NotificationPolicy` |
+| `Saga` | `ticketing::application::ticket_lifecycle::TicketLifecycleSaga` |
 
 ## 3. Командная сторона
 
@@ -129,10 +150,11 @@ flowchart LR
 `CloseTicketCommand`, …), достраивает их до команд агрегатов — выдаёт идентификаторы,
 берёт время из `Clock`, подставляет данные других агрегатов — и выполняет через репозитории.
 
-- **`OpenTickets`** — собственная синхронная проекция командной стороны: число открытых
-  тикетов тенанта и кандидаты на закрытие по неактивности. Она согласована с записью
-  (обновляется в той же операции), поэтому скидку считают по ней, а не по read-модели,
-  которая может отставать.
+- **`OpenTickets`** — собственная синхронная проекция командной стороны: счётчик открытых
+  тикетов на тенанта, ответ за O(1). Она согласована с записью (обновляется в той же
+  операции), поэтому скидку считают по ней, а не по read-модели, которая может отставать.
+- **`Clock`** — источник времени: `SystemClock` в работе, `ManualClock` в тестах, `ScaledClock`
+  для демонстрации сроков (`--time-scale`). Домен и сага разницы не видят.
 - **Outbox.** Каждое записанное событие сразу попадает в outbox, `take_outbox()` их
   забирает. События не теряются, даже если команда записала часть событий и вернула ошибку.
 
@@ -147,8 +169,8 @@ flowchart LR
 - **Журнал и версии.** После каждой команды актор забирает outbox, присваивает событиям
   следующие глобальные версии, дописывает их в журнал (общий поток всех стримов)
   и рассылает подписчикам. Отклонённая команда версию не занимает.
-- **Подписка** с любой версии: история из журнала, затем новые события. Проекция и политика
-  могут стартовать в любой момент — даже после seed.
+- **Подписка** с любой версии: история из журнала, затем новые события. Проекция, политики
+  и сага могут стартовать в любой момент — даже после seed.
 
 ```mermaid
 sequenceDiagram
@@ -177,9 +199,10 @@ sequenceDiagram
 
 | View | Поля |
 |---|---|
-| `TicketView` | `ticket_id, category, description, status, assigned_agent, tenant_id, created_at, closed_at, version` |
+| `TicketView` | `ticket_id, category, description, status, assigned_agent, tenant_id, created_at, closed_at, close_reason, last_activity, reminders_sent, version`; `closes_at()` вычисляется из `last_activity` и поэтому не может с ней разойтись |
 | `TenantView` | `tenant_id, tenant_name, discount_rate, open_tickets, version` |
 | `UserView` | `user_id, user_name, role, version` |
+| `NotificationView` | `notification_id, recipient, ticket_id, kind, at, version` |
 | `Changes` | `version` модели и изменённые записи каждого вида |
 
 `version` записи — версия её последнего изменения. У закрытого тикета остаётся агент,
@@ -192,11 +215,12 @@ sequenceDiagram
 | `active_by_agent: UserId → {TicketId}` — незакрытые тикеты агента | `ActiveTicketsOfAgent` |
 | `by_tenant: TenantId → {TicketId}` | `ListTickets { tenant_id }`, `UnassignedTicketsOfTenant` |
 | `closed: {(closed_at, TicketId)}` — упорядочен по времени | `TicketsClosedSince(t)` — диапазон `t..` |
+| `inbox: Recipient → [номер уведомления]` | `NotificationsOf(user)`: агенту — его личные, администратору — общие, остальным — ничего |
 | `changed: {(Version, запись)}` — каждая запись один раз, под последней версией | `ChangesSince(v)` — диапазон `v+1..` |
 
 Запросы: `GetTicket`, `ListTickets { status, tenant_id }`, `ActiveTicketsOfAgent`,
 `UnassignedTicketsOfTenant`, `TicketsClosedSince`, `GetTenant`, `ListTenants`, `ListUsers`,
-`ChangesSince`. Read-модель не знает текущего времени: «за последние N дней» превращает
+`NotificationsOf`, `ChangesSince`. Read-модель не знает текущего времени: «за последние N дней» превращает
 в момент `since` сервер.
 
 ### 4.3. Применение событий
@@ -205,33 +229,126 @@ sequenceDiagram
 - Пропуск версии — ошибка `Gap`, ссылка на неизвестную запись — `UnknownTicket` /
   `UnknownTenant`. Каждый обработчик сначала находит все нужные записи и только потом
   меняет их, так что ошибка не оставляет модель наполовину обновлённой.
+- Уведомления read-модель строит той же чистой `NotificationPolicy`, что и доставка: правила
+  «кого о чём уведомить» записаны в одном месте и разойтись не могут.
 - Блокировка берётся только на время синхронного обновления или чтения и никогда не
   держится через `await`. Ждущих (`wait_until(version)`) модель будит, только когда
   изменения уже видны читателям.
 
-## 5. Фоновые процессы
+## 5. Оркестрация и хореография
 
-`server::app` запускает рядом с актором три задачи tokio:
+`server::app` запускает рядом с актором четыре задачи tokio. Они не знают друг о друге:
+единственная связь между ними — журнал событий.
 
-| Задача | Что делает |
-|---|---|
-| `run_projection(актор, ReadModel)` | Держит read-модель в актуальном состоянии. |
-| `run_policy(актор, v0, DiscountPolicy, актор)` | На события, меняющие число открытых тикетов, отправляет `ApplyDiscount`. `DiscountUnchanged` — норма, остальные отказы пишутся в stderr. |
-| `command::repeat(актор, 60 с, CloseInactiveTickets)` | Время как источник команд: закрывает тикеты без активности 7 дней. |
+| Задача | Стиль | Что делает |
+|---|---|---|
+| `run_ticket_lifecycle(актор, часы, тик)` | оркестрация | Ведёт каждый открытый тикет к закрытию: держит дедлайны, отправляет `SendReminder` и `CloseTicket`. Устаревшие дедлайны — норма, остальные отказы пишутся в stderr. |
+| `run_policy(актор, v0, DiscountPolicy, актор)` | хореография | На события, меняющие число открытых тикетов, отправляет `ApplyDiscount`. `DiscountUnchanged` — норма, остальные отказы пишутся в stderr. |
+| `run_notifications(актор, v0, LogNotifier)` | хореография | Превращает события в уведомления и передаёт их порту `Notifier`. |
+| `run_projection(актор, ReadModel)` | хореография | Держит read-модель в актуальном состоянии. |
 
 ```mermaid
 flowchart LR
     client(["клиенты"]) -->|POST| http["HTTP: commands"]
     http -->|CommandBus| actor[["Актор<br/>TicketService"]]
-    timer(["каждые 60 с"]) -->|CloseInactiveTickets| actor
-    actor -->|Envelope| proj["run_projection"]
+    actor -->|Envelope| saga["run_ticket_lifecycle<br/>TicketLifecycleSaga"]
+    clock(["Clock, тик"]) --> saga
+    saga -->|"SendReminder, CloseTicket"| actor
     actor -->|Envelope| pol["run_policy<br/>DiscountPolicy"]
     pol -->|ApplyDiscount| actor
+    actor -->|Envelope| notif["run_notifications<br/>NotificationPolicy"]
+    notif --> port["Notifier: LogNotifier"]
+    actor -->|Envelope| proj["run_projection"]
     proj --> rm[("ReadModel")]
     rm -->|QueryHandler| q["HTTP: queries"]
     rm -->|wait_until| lp["HTTP: changes<br/>long polling"]
     q --> client
     lp --> client
+```
+
+### 5.1. Оркестратор: `TicketLifecycleSaga`
+
+Один экземпляр на тикет. Сроки считаются от последней активности: создания, назначения
+агента или повторного открытия. Само напоминание активностью не считается.
+
+| День | Дедлайн | Команда | Результат |
+|---|---|---|---|
+| 3 | `Reminder(Stale)` | `SendReminder` | `ReminderSent` агенту, а если агента нет — администраторам |
+| 9 | `Reminder(ClosingSoon)` | `SendReminder` | то же |
+| 10 | `AutoClose` | `CloseTicket { Inactivity }` | `TicketClosed` |
+
+```mermaid
+stateDiagram-v2
+    [*] --> Running: TicketCreated, TicketReopened<br/>три срока от времени события
+    Running --> [*]: TicketClosed<br/>дедлайны удалены
+    note right of Running
+        AgentAssigned: все сроки заново
+        дедлайн напоминания: SendReminder
+        дедлайн AutoClose: CloseTicket, ждём TicketClosed
+    end note
+```
+
+**Решает агрегат, а не сага.** Команда могла устареть, пока шла к актору, поэтому агрегат
+проверяет срок сам: `StillActive`, `ReminderNotDue`, `ReminderAlreadySent`, `Closed`. Для саги
+такой отказ — обычный исход: о том, что произошло на самом деле, сообщит событие, которое
+команду опередило. Поэтому и команда автозакрытия не завершает процесс: сага дожидается
+`TicketClosed`.
+
+**Цикл `run_ticket_lifecycle`.** Сага работает в одной задаче: `select!` с приоритетом событий
+над тиком. На каждом тике цикл по очереди разбирает все накопившиеся события и запускает один
+созревший дедлайн, затем ждёт ответ на его команду и повторяет. Отсюда три свойства:
+
+- Отменённые дедлайны снимаются сразу, а не ждут своего срока, и очередь не копит мусор.
+- Много дедлайнов, созревших одновременно, занимают в очереди актора по одному месту. HTTP-команды
+  не ждут, пока пройдёт вся пачка.
+- Событие, пришедшее между двумя созревшими дедлайнами, успевает отменить второй из них.
+  Остаётся узкая гонка с командой, которая уже в пути: её отклонит агрегат.
+
+**Почему очередь, а не иерархическое колесо времени.** Разовый замер (код замера в репозиторий
+не входит) показал, что колесо быстрее `DeadlineQueue` в 5–10 раз на отдельных операциях, но
+предел системы — актор, около 7,3 мкс на команду. Настоящим узким местом оказался подсчёт
+открытых тикетов перебором: на 300 тысячах тикетов он занимал 328 мкс, со счётчиком — 6,9 мкс.
+API очереди узкий, поэтому заменить её позже можно, не трогая сагу.
+
+### 5.2. Хореография
+
+Участники реагируют на факты сами, и никто ими не управляет. Новый участник не требует
+изменений ни в саге, ни в других участниках: `NotificationPolicy` добавлена, не затронув
+`DiscountPolicy`, а сага не знает, что её напоминания кто-то доставляет.
+
+| Событие | `NotificationPolicy` → получатель |
+|---|---|
+| `TicketCreated` | `NewTicket` → администраторы |
+| `TicketReopened` | `Reopened` → администраторы |
+| `AgentAssigned` | `Assigned` → новый агент; `Unassigned` → прежний, если он был |
+| `ReminderSent` | `Reminder(kind)` → агент или, если его нет, администраторы |
+| `TicketClosed` | `Closed(reason)` → агент; без агента при `Inactivity` → администраторы, при `Resolved` → никто |
+
+Доставка — порт `Notifier`: политика решает, кого уведомить, `run_notifications` передаёт
+уведомления порту, а сервер подключает `LogNotifier`, который пишет их в stdout. Настоящий канал
+(почта, мессенджер) — другая реализация того же трейта.
+
+### 5.3. Пример: тикет без активности
+
+```mermaid
+sequenceDiagram
+    participant C as Часы
+    participant S as Сага
+    participant A as Актор
+    participant O as Участники хореографии
+
+    A->>S: TicketCreated (день 0)
+    Note over S: дедлайны: день 3, день 9, день 10
+    C->>S: день 3
+    S->>A: SendReminder(Stale)
+    A->>O: ReminderSent — уведомление, reminders_sent = 1
+    C->>S: день 9
+    S->>A: SendReminder(ClosingSoon)
+    A->>O: ReminderSent — уведомление, reminders_sent = 2
+    C->>S: день 10
+    S->>A: CloseTicket(Inactivity)
+    A->>S: TicketClosed — процесс завершён
+    A->>O: TicketClosed — уведомление, read-модель, пересчёт скидки
 ```
 
 ## 6. Полная схема команд и событий
@@ -240,34 +357,34 @@ flowchart LR
 
 | Команда (`command::Command`) | Кто отправляет | Команда агрегата | Событие | Отказы → HTTP |
 |---|---|---|---|---|
-| `RegisterTenant` | seed | `TenantCommand::Register` с выданным id | `TenantRegistered` | `EmptyName` 422 |
-| `RegisterUser` | seed | `UserCommand::Register` с выданным id | `UserRegistered` | `EmptyName` 422 |
-| `CreateTicket` | seed | `TicketCommand::Create` с id и временем | `TicketCreated` | `UnknownTenant` 404, `EmptyDescription` 422 |
+| `RegisterTenant` | `POST /api/tenants`, seed | `TenantCommand::Register` с выданным id | `TenantRegistered` | `EmptyName` 422 |
+| `RegisterUser` | `POST /api/users`, seed | `UserCommand::Register` с выданным id | `UserRegistered` | `EmptyName` 422 |
+| `CreateTicket` | `POST /api/tickets`, seed | `TicketCommand::Create` с id и временем | `TicketCreated` | `UnknownTenant` 404, `EmptyDescription` 422, `EmptyCategory` 422 |
 | `AssignAgent` | `POST /api/tickets/{id}/assign` | `TicketCommand::AssignAgent` с агрегатом `User` и временем | `AgentAssigned` | `UnknownUser` 404, `NotFound` 404, `NotAnAgent` 422, `AlreadyAssigned` 409, `Closed` 409 |
-| `CloseTicket` | `POST /api/tickets/{id}/close` (причина `Resolved`) | `TicketCommand::Close` | `TicketClosed` | `NotFound` 404, `Closed` 409 |
+| `CloseTicket` | `POST /api/tickets/{id}/close` (причина `Resolved`), сага (причина `Inactivity`) | `TicketCommand::Close` | `TicketClosed` | `NotFound` 404, `Closed` 409; для саги — `StillActive`, `Closed` (норма) |
 | `ReopenTicket` | `POST /api/tickets/{id}/open` | `TicketCommand::Reopen` | `TicketReopened` | `NotFound` 404, `AlreadyOpen` 409 |
+| `SendReminder` | сага | `TicketCommand::SendReminder { kind, at }` | `ReminderSent` | `ReminderNotDue`, `ReminderAlreadySent`, `Closed` (норма) |
 | `ApplyDiscount` | `DiscountPolicy` | `TenantCommand::ApplyDiscount` с числом открытых из `OpenTickets` | `DiscountApplied` | `NotFound`, `DiscountUnchanged` (норма) |
-| `CloseInactiveTickets` | расписание | `TicketCommand::Close { Inactivity }` для каждого тикета из `OpenTickets::inactive_at` | `TicketClosed` × N | — |
-
-Создание тикетов и регистрация доступны только через seed: HTTP-эндпоинтов для них
-задание не требует. Закрыть по неактивности вручную нельзя, пока таймаут не истёк
-(`StillActive`), — это проверяет агрегат.
 
 ### 6.2. События и их потребители
 
-| Событие | Поля | `OpenTickets` (запись) | `ReadModel` (чтение) | `DiscountPolicy` |
-|---|---|---|---|---|
-| `TenantRegistered` | `tenant_id, tenant_name` | — | новый `TenantView`: 0%, 0 открытых | — |
-| `UserRegistered` | `user_id, user_name, role` | — | новый `UserView` | — |
-| `TicketCreated` | `ticket_id, category, description, tenant_id, at` | тикет открыт, активность = `at` | новый `TicketView` (Open); `by_tenant`; тенант: открытых +1 | `ApplyDiscount(tenant_id)` |
-| `AgentAssigned` | `ticket_id, agent_id, previous_agent_id, at` | активность = `at` | агент, InProgress; `active_by_agent`: от прежнего агента к новому | — |
-| `TicketClosed` | `ticket_id, tenant_id, reason, at` | тикет убран | Closed, `closed_at`; убран из `active_by_agent`; в индекс `closed`; тенант: открытых −1 | `ApplyDiscount(tenant_id)` |
-| `TicketReopened` | `ticket_id, tenant_id, at` | снова открыт, активность = `at` | Open, без агента, `closed_at` сброшен; убран из `closed`; тенант: открытых +1 | `ApplyDiscount(tenant_id)` |
-| `DiscountApplied` | `tenant_id, previous_rate, discount_rate, open_tickets` | — | `discount_rate` тенанта | — (иначе политика реагировала бы на свой результат) |
+| Событие | Поля | `TicketLifecycleSaga` | `OpenTickets` (запись) | `ReadModel` (чтение) | `DiscountPolicy` |
+|---|---|---|---|---|---|
+| `TenantRegistered` | `tenant_id, tenant_name` | — | — | новый `TenantView`: 0%, 0 открытых | — |
+| `UserRegistered` | `user_id, user_name, role` | — | — | новый `UserView` | — |
+| `TicketCreated` | `ticket_id, category, description, tenant_id, at` | старт, три срока | открытых +1 | новый `TicketView` (Open); `by_tenant`; тенант: открытых +1 | `ApplyDiscount(tenant_id)` |
+| `AgentAssigned` | `ticket_id, agent_id, previous_agent_id, at` | все сроки заново | — | агент, InProgress, активность, счётчик напоминаний 0; `active_by_agent`: от прежнего агента к новому | — |
+| `ReminderSent` | `ticket_id, agent_id, kind, at` | — | — | `reminders_sent` +1 | — |
+| `TicketClosed` | `ticket_id, tenant_id, agent_id, reason, at` | конец, дедлайны удалены | открытых −1 | Closed, `closed_at`, `close_reason`; убран из `active_by_agent`; в индекс `closed`; тенант: открытых −1 | `ApplyDiscount(tenant_id)` |
+| `TicketReopened` | `ticket_id, tenant_id, at` | старт заново | открытых +1 | Open, без агента, `closed_at` и `close_reason` сброшены, активность, счётчик 0; убран из `closed`; тенант: открытых +1 | `ApplyDiscount(tenant_id)` |
+| `DiscountApplied` | `tenant_id, previous_rate, discount_rate, open_tickets` | — | — | `discount_rate` тенанта | — (иначе политика реагировала бы на свой результат) |
+
+Какие уведомления порождают события — в [разделе 5.2](#52-хореография). `agent_id` в
+`ReminderSent` равен `None`, если агента нет: такое напоминание адресовано администраторам.
 
 Каждое событие меняет запись в read-модели и её версию, поэтому все они видны клиентам
-в `GET /api/changes`. `tenant_id` в `TicketClosed` и `TicketReopened` есть именно ради
-потребителей: политика — чистая функция, тенанта ей нужно знать из самого события.
+в `GET /api/changes`. `tenant_id` и `agent_id` в `TicketClosed` и `tenant_id` в `TicketReopened`
+есть именно ради потребителей: политика — чистая функция, ей нужно узнать всё из самого события.
 
 ### 6.3. Пример: закрытие тикета, после которого пропадает скидка
 
@@ -303,6 +420,9 @@ sequenceDiagram
 | `POST /api/tickets/{id}/open` | `CommandAcceptedDto` |
 | `POST /api/tickets/{id}/close` | `CommandAcceptedDto` |
 | `POST /api/tickets/{id}/assign` с `{"agent_id": N}` | `CommandAcceptedDto` |
+| `POST /api/tenants` с `{"tenant_name": "..."}` | `CommandAcceptedDto` |
+| `POST /api/users` с `{"user_name": "...", "role": "Customer\|Agent\|Admin"}` | `CommandAcceptedDto` |
+| `POST /api/tickets` с `{"category": "...", "description": "...", "tenant_id": N}` | `CommandAcceptedDto` |
 | `GET /api/tickets?status=Open\|InProgress\|Closed&tenant=N` | `[TicketDto]`, фильтры необязательны |
 | `GET /api/tickets/{id}` | `TicketDto` или 404 |
 | `GET /api/tickets/closed?days=N` | `[TicketDto]` — закрытые за N дней, по времени закрытия |
@@ -310,6 +430,7 @@ sequenceDiagram
 | `GET /api/tenants/{id}/tickets/unassigned` | `[TicketDto]` — открытые и никому не назначенные |
 | `GET /api/tenants`, `GET /api/tenants/{id}` | `[TenantDto]`, `TenantDto` или 404 |
 | `GET /api/users` | `[UserDto]` |
+| `GET /api/users/{id}/notifications` | `[NotificationDto]` — входящие пользователя, от старых к новым |
 | `GET /api/changes[?epoch=E&since=V]` | `ChangesDto` — long polling |
 
 ### 7.2. Long polling
@@ -325,7 +446,7 @@ sequenceDiagram
 | своя эпоха, изменений нет | ждёт изменений до 25 с; по таймауту — пустой ответ с той же версией |
 
 Ответ содержит каждую изменённую запись один раз в последнем состоянии — промежуточные
-состояния не нужны. Следующий запрос — с `ChangesDto::cursor()`.
+состояния не нужны. Уведомления не меняются, поэтому каждое приходит один раз. Следующий запрос — с `ChangesDto::cursor()`.
 
 `since` может обгонять read-модель: клиент получает версию команды раньше, чем проекция
 её применит. Тогда сервер просто ждёт — так клиент гарантированно видит собственные изменения.
@@ -333,7 +454,8 @@ sequenceDiagram
 ### 7.3. Клиент
 
 - **`Replica`** — копия read-модели сервера на клиенте. Полный ответ заменяет всё,
-  дельта заменяет записи по одной.
+  дельта заменяет записи по одной. Уведомления всех получателей лежат здесь же, и
+  `notifications_of` отбирает входящие пользователя по тем же правилам, что и сервер.
 - **Цикл синхронизации** `TicketViewModel::sync_forever`: `poll_once` за `poll_once`;
   после обрыва связи — пауза 0,5 → 1 → 2 → … → 10 с, после успеха сбрасывается.
   Индикатор показывает `live · vN` или `offline · reconnecting…`.
@@ -343,6 +465,13 @@ sequenceDiagram
   сервера) снимает ожидание: версия из прошлого запуска уже не придёт.
 - **Проверки на обеих сторонах.** Клиент не отправляет заведомо недопустимую команду
   (`TicketRules`), сервер всё равно проверяет её в агрегате.
+- **Формы создания** тенанта, пользователя и тикета: поля живут в `CreationForms`, а запрос
+  собирают функции модели (`new_tenant`, `new_user`, `new_ticket`) — они и решают, доступна ли
+  кнопка. При успехе текст очищается, при отказе сохраняется вместе с сообщением об ошибке.
+- **Панель уведомлений.** Выбор пользователя — это не вход в систему: от него зависит только то,
+  чьи входящие показаны. Новый запрос к серверу не нужен, всё уже пришло через long polling.
+- **Сроки на карточке тикета** — абсолютные даты с сервера. Клиент не считает обратный отсчёт от
+  своих часов: при `--time-scale` они не совпадают с часами системы.
 - **Панель запросов** вызывает GET-запросы read-модели и выполняет выбранный запрос заново,
   когда long polling приносит изменения.
 
@@ -373,15 +502,27 @@ sequenceDiagram
 ## 8. Гарантии и ограничения
 
 - **Согласованность.** Командная сторона строго согласована: один писатель, проверки
-  в агрегате. Read-модель и скидка согласованы в конечном счёте: обновляются асинхронно,
+  в агрегате. Read-модель, скидка и сага согласованы в конечном счёте: обновляются асинхронно,
   отставание видно по версии, дождаться результата команды можно по её версии.
 - **Порядок.** Все события имеют единый порядок версий; проекция применяет их по порядку
-  без пропусков, политика реагирует в том же порядке.
-- **Доставка.** Подписчики получают каждое событие ровно один раз в пределах процесса;
+  без пропусков, политики и сага реагируют в том же порядке.
+- **Доставка событий.** Подписчики получают каждое событие ровно один раз в пределах процесса;
   проекция к тому же идемпотентна по версии.
+- **Точность дедлайнов.** Дедлайн срабатывает на ближайшем тике, поэтому опаздывает не больше чем
+  на тик (по умолчанию 1 с) плюс очередь других дедлайнов. Раньше срока команда не пройдёт:
+  это проверяет агрегат. При `--time-scale` тик сокращается, чтобы опоздание было не больше минуты
+  времени системы, но не короче 10 мс.
+- **Доставка уведомлений — не более одного раза.** Отказ `Notifier` уходит в обработчик ошибок,
+  повторов нет. `run_notifications` не хранит свою позицию: с постоянным журналом перезапуск
+  прислал бы всё заново, поэтому там понадобились бы сохранённая позиция и идемпотентный получатель.
+- **Нет авторизации.** Long polling приносит уведомления всех получателей, и клиент отбирает
+  нужные сам. В настоящей системе сервер фильтровал бы их по вошедшему пользователю.
+- **Нет постраничной выдачи и отметок о прочтении.** Журнал, входящие и полный ответ
+  `/api/changes` растут вместе с историей.
 - **Хранение в памяти.** Всё состояние живёт в одном процессе и пропадает при перезапуске;
   журнал актора хранит все события, чтобы на него можно было подписаться с любой версии.
   Для учебной системы это осознанный выбор: трейты хранилищ и проекции позволяют заменить
-  реализации, не трогая остальной код.
+  реализации, не трогая остальной код. Сага восстановится из постоянного журнала сама: сроки
+  считаются из времени в событиях, а просроченные за время простоя дедлайны сработают по порядку.
 - **Один сервер.** Актор и read-модель — в одном процессе. Масштабирование потребовало бы
   внешнего журнала событий (реализация `EventSource`) и общего хранилища read-модели.

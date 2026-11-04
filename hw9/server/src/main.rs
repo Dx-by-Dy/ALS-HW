@@ -3,53 +3,88 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use server::{Config, app, seed};
-use ticketing::application::clock::SystemClock;
+use ticketing::application::clock::{ScaledClock, SystemClock};
 use tower_http::services::ServeDir;
 
 const DEFAULT_PORT: u16 = 3000;
-const USAGE: &str = "usage: server [--port <PORT>] [--seed]";
+const USAGE: &str = "usage: server [--port <PORT>] [--seed] [--time-scale <N>]";
+const SECS_PER_DAY: f64 = 86_400.0;
 /// Сюда `trunk build` складывает собранный клиент.
 const CLIENT_DIST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../client/dist");
 
 /// Что просили в командной строке.
 #[derive(Debug, PartialEq, Eq)]
 enum Cli {
-    Run { port: u16, seed: bool },
+    Run(Options),
     Help,
 }
 
-/// `server [--port <PORT>] [--seed]`; порт также можно задать как `--port=<PORT>`.
+#[derive(Debug, PartialEq, Eq)]
+struct Options {
+    port: u16,
+    seed: bool,
+    /// Во сколько раз часы системы идут быстрее настоящих.
+    time_scale: u32,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            port: DEFAULT_PORT,
+            seed: false,
+            time_scale: 1,
+        }
+    }
+}
+
+/// Значения можно задать и следующим аргументом, и через `=`: `--port=<PORT>`.
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli, String> {
-    let mut port = DEFAULT_PORT;
-    let mut seed = false;
+    let mut options = Options::default();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
-        let value = match arg.as_str() {
-            "-h" | "--help" => return Ok(Cli::Help),
-            "--seed" => {
-                seed = true;
-                continue;
-            }
-            "-p" | "--port" => args.next().ok_or("--port needs a value")?,
-            _ => match arg.strip_prefix("--port=") {
-                Some(value) => value.to_owned(),
-                None => return Err(format!("unexpected argument '{arg}'")),
-            },
+        let (name, inline) = match arg.split_once('=') {
+            Some((name, value)) => (name, Some(value.to_owned())),
+            None => (arg.as_str(), None),
         };
-        port = value
-            .parse()
-            .map_err(|_| format!("invalid port '{value}', expected a number 0-65535"))?;
+        match (name, inline) {
+            ("-h" | "--help", None) => return Ok(Cli::Help),
+            ("--seed", None) => options.seed = true,
+            ("-p" | "--port", inline) => {
+                let value = inline
+                    .or_else(|| args.next())
+                    .ok_or("--port needs a value")?;
+                options.port = value
+                    .parse()
+                    .map_err(|_| format!("invalid port '{value}', expected a number 0-65535"))?;
+            }
+            ("--time-scale", inline) => {
+                let value = inline
+                    .or_else(|| args.next())
+                    .ok_or("--time-scale needs a value")?;
+                options.time_scale =
+                    value
+                        .parse()
+                        .ok()
+                        .filter(|scale| *scale >= 1)
+                        .ok_or_else(|| {
+                            format!(
+                                "invalid time scale '{value}', expected a positive whole number"
+                            )
+                        })?;
+            }
+            _ => return Err(format!("unexpected argument '{arg}'")),
+        }
     }
-    Ok(Cli::Run { port, seed })
+    Ok(Cli::Run(options))
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let (port, with_seed) = match parse_args(std::env::args().skip(1)) {
-        Ok(Cli::Run { port, seed }) => (port, seed),
+    let options = match parse_args(std::env::args().skip(1)) {
+        Ok(Cli::Run(options)) => options,
         Ok(Cli::Help) => {
             println!(
-                "{USAGE}\n\nServes the ticket API and the web client on 127.0.0.1 (default port {DEFAULT_PORT}).\nThe system starts empty; --seed fills it with demo data."
+                "{USAGE}\n\nServes the ticket API and the web client on 127.0.0.1 (default port {DEFAULT_PORT}).\nThe system starts empty; --seed fills it with demo data.\n--time-scale <N> runs the clock N times faster, so deadlines can be watched: with 8640 a day passes every 10 seconds."
             );
             return ExitCode::SUCCESS;
         }
@@ -58,7 +93,7 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match run(port, with_seed).await {
+    match run(options).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
@@ -67,14 +102,26 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(port: u16, with_seed: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, options.port));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| format!("cannot listen on {addr}: {e}"))?;
 
-    let app = app(SystemClock, Config::default());
-    if with_seed {
+    let app = match options.time_scale {
+        1 => app(SystemClock, Config::default()),
+        scale => {
+            println!(
+                "Clock runs {scale} times faster: a day passes every {:.1} s",
+                SECS_PER_DAY / f64::from(scale)
+            );
+            app(
+                ScaledClock::starting_now(scale),
+                Config::for_time_scale(scale),
+            )
+        }
+    };
+    if options.seed {
         seed(&app.commands).await?;
     }
     if !Path::new(CLIENT_DIST).join("index.html").exists() {
@@ -100,16 +147,22 @@ mod tests {
     fn port_defaults_to_3000() {
         assert_eq!(
             parse(&[]),
-            Ok(Cli::Run {
+            Ok(Cli::Run(Options {
                 port: 3000,
-                seed: false
-            })
+                seed: false,
+                time_scale: 1
+            }))
         );
     }
 
     #[test]
     fn port_is_taken_from_arguments() {
-        let run = |port| Cli::Run { port, seed: false };
+        let run = |port| {
+            Cli::Run(Options {
+                port,
+                ..Options::default()
+            })
+        };
         assert_eq!(parse(&["--port", "8000"]), Ok(run(8000)));
         assert_eq!(parse(&["-p", "8001"]), Ok(run(8001)));
         assert_eq!(parse(&["--port=0"]), Ok(run(0)));
@@ -119,10 +172,39 @@ mod tests {
     fn seed_is_off_unless_asked_for() {
         assert_eq!(
             parse(&["--seed", "--port", "8000"]),
-            Ok(Cli::Run {
+            Ok(Cli::Run(Options {
                 port: 8000,
-                seed: true
+                seed: true,
+                ..Options::default()
+            }))
+        );
+    }
+
+    #[test]
+    fn time_scale_is_taken_from_arguments() {
+        let run = |time_scale| {
+            Cli::Run(Options {
+                time_scale,
+                ..Options::default()
             })
+        };
+        assert_eq!(parse(&["--time-scale", "8640"]), Ok(run(8640)));
+        assert_eq!(parse(&["--time-scale=60"]), Ok(run(60)));
+    }
+
+    #[test]
+    fn bad_time_scale_is_reported() {
+        let invalid = |value: &str| {
+            Err(format!(
+                "invalid time scale '{value}', expected a positive whole number"
+            ))
+        };
+        assert_eq!(parse(&["--time-scale", "0"]), invalid("0"));
+        assert_eq!(parse(&["--time-scale", "-5"]), invalid("-5"));
+        assert_eq!(parse(&["--time-scale=fast"]), invalid("fast"));
+        assert_eq!(
+            parse(&["--time-scale"]),
+            Err("--time-scale needs a value".to_owned())
         );
     }
 

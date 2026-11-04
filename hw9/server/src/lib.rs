@@ -57,6 +57,21 @@ impl Default for Config {
     }
 }
 
+impl Config {
+    /// Настройки для часов, идущих в `scale` раз быстрее настоящих. Дедлайны срабатывают на тике,
+    /// поэтому он сокращается вместе с масштабом: опоздание не больше минуты времени системы.
+    /// Чаще раза в 10 мс проверять незачем: ниже этого масштаб всё равно нельзя заметить.
+    pub fn for_time_scale(scale: u32) -> Self {
+        const MAX_LAG: Duration = Duration::from_secs(60);
+        const MIN_TICK: Duration = Duration::from_millis(10);
+        let default = Self::default();
+        Self {
+            deadline_tick: (MAX_LAG / scale.max(1)).clamp(MIN_TICK, default.deadline_tick),
+            ..default
+        }
+    }
+}
+
 /// Запущенная система: HTTP-роутер и стороны CQRS, к которым он обращается.
 pub struct App {
     pub router: Router,
@@ -228,7 +243,7 @@ mod tests {
     };
     use http_body_util::BodyExt;
     use serde::de::DeserializeOwned;
-    use ticketing::application::clock::ManualClock;
+    use ticketing::application::clock::{ManualClock, ScaledClock};
     use ticketing::domain::ticket::{INACTIVITY_TIMEOUT_SECS, STALE_REMINDER_AFTER_SECS};
     use tower::ServiceExt;
 
@@ -667,6 +682,50 @@ mod tests {
             .filter(|t| t.close_reason == Some(CloseReason::Inactivity))
             .count();
         assert_eq!(auto_closed, 8);
+    }
+
+    #[test]
+    fn deadline_tick_shrinks_with_time_scale() {
+        let tick = |scale| Config::for_time_scale(scale).deadline_tick;
+        assert_eq!(tick(1), Duration::from_secs(1));
+        assert_eq!(tick(60), Duration::from_secs(1));
+        assert_eq!(tick(600), Duration::from_millis(100));
+        assert_eq!(tick(86_400), Duration::from_millis(10));
+        assert_eq!(tick(0), Duration::from_secs(1));
+    }
+
+    /// Без заглушек времени: те же часы и настройки, что у `--time-scale`.
+    #[tokio::test]
+    async fn accelerated_clock_closes_ticket_in_real_time() {
+        const TEN_DAYS_PER_SECOND: u32 = 864_000;
+        let clock = ScaledClock::starting_now(TEN_DAYS_PER_SECOND);
+        let app = app(clock, Config::for_time_scale(TEN_DAYS_PER_SECOND));
+        let router = app.router;
+        for (uri, body) in [
+            (api::TENANTS, r#"{"tenant_name":"Acme"}"#),
+            (
+                api::TICKETS,
+                r#"{"category":"Billing","description":"Refund","tenant_id":1}"#,
+            ),
+        ] {
+            let (status, _): (_, CommandAcceptedDto) = send(&router, "POST", uri, Some(body)).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        let closed = tokio::time::timeout(WAIT, async {
+            loop {
+                let tickets: Vec<TicketDto> = get(&router, api::TICKETS).await;
+                if let Some(ticket) = tickets.into_iter().find(|t| t.closed_at.is_some()) {
+                    return ticket;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("ticket closes by deadline");
+
+        assert_eq!(closed.close_reason, Some(CloseReason::Inactivity));
+        assert_eq!(closed.reminders_sent, 2);
     }
 
     #[test]
