@@ -1,13 +1,15 @@
 //! HTTP-адаптер над CQRS: команды уходят в актор командной стороны, запросы читают read-модель.
 //!
 //! [`app`] собирает систему целиком. Кроме актора, в отдельных задачах tokio работают
-//! проекция (события → read-модель), политика скидок (события → команды) и оркестратор
-//! жизненного цикла тикетов с напоминаниями и автозакрытием. Клиенты узнают об изменениях через long polling
+//! проекция (события → read-модель), политика скидок (события → команды), уведомления
+//! (события → журнал сервера) и оркестратор жизненного цикла тикетов с напоминаниями
+//! и автозакрытием. Клиенты узнают об изменениях через long polling
 //! `GET /api/changes?since=N`.
 
 mod commands;
 mod dto;
 mod error;
+mod notifier;
 mod queries;
 mod seed;
 
@@ -27,11 +29,12 @@ use framework::cqrs::{
 use query::ReadModel;
 use ticketing::application::{
     clock::Clock, discount_policy::DiscountPolicy, error::ServiceError,
-    ticket_service::TicketService,
+    notifications::run_notifications, ticket_service::TicketService,
 };
 use ticketing::domain::{DomainEvent, tenant::TenantError, ticket::TicketError};
 
 pub use error::ApiError;
+use notifier::LogNotifier;
 pub use seed::seed;
 
 type ApiResult<T> = Result<Json<T>, ApiError>;
@@ -71,13 +74,14 @@ struct AppState {
     epoch: u64,
 }
 
-/// Запускает командную сторону, проекцию, политику скидок и оркестратор в задачах tokio
+/// Запускает командную сторону, проекцию, политику скидок, уведомления и оркестратор в задачах tokio
 /// и возвращает роутер над ними. Должна вызываться внутри рантайма tokio.
 pub fn app<C: Clock + Clone + Send + Sync + 'static>(clock: C, config: Config) -> App {
     let commands = command::spawn(TicketService::new(clock.clone()));
     let read_model = ReadModel::default();
     spawn_projection(&commands, &read_model);
     spawn_discount_policy(&commands);
+    spawn_notifications(&commands);
     spawn_ticket_lifecycle(&commands, clock.clone(), config.deadline_tick);
 
     let state = Arc::new(AppState {
@@ -143,6 +147,16 @@ fn spawn_discount_policy(commands: &CommandActorHandle) {
             .await;
         if let Err(e) = result {
             eprintln!("error: discount policy stopped: {e}");
+        }
+    });
+}
+
+fn spawn_notifications(commands: &CommandActorHandle) {
+    let source = commands.clone();
+    tokio::spawn(async move {
+        let result = run_notifications(&source, Version(0), &LogNotifier, |_, e| match e {}).await;
+        if let Err(e) = result {
+            eprintln!("error: notifications stopped: {e}");
         }
     });
 }

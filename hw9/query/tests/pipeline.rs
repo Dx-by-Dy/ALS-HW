@@ -1,7 +1,9 @@
 //! Асинхронный конвейер целиком: команды идут в актор командной стороны, проекция
 //! в отдельной задаче получает события и обновляет read-модель, политика скидок
-//! в другой задаче отвечает на события новыми командами.
+//! в другой задаче отвечает на события новыми командами. Здесь же хореография уведомлений:
+//! они узнают о событиях сами, без оркестратора.
 
+use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,17 +29,20 @@ use ticketing::application::{
     },
     discount_policy::DiscountPolicy,
     error::ServiceError,
+    notifications::{Notification, NotificationKind, Notifier, Recipient, run_notifications},
     ticket_service::TicketService,
 };
 use ticketing::domain::{
     DomainEvent,
     tenant::{DiscountRate, TenantError, TenantId},
     ticket::{
-        CloseReason, INACTIVITY_TIMEOUT_SECS, STALE_REMINDER_AFTER_SECS, TicketId, TicketStatus,
+        CloseReason, INACTIVITY_TIMEOUT_SECS, ReminderKind, STALE_REMINDER_AFTER_SECS, TicketId,
+        TicketStatus,
     },
     time::Timestamp,
     user::{Role, UserId},
 };
+use tokio::sync::mpsc;
 
 const ACME: TenantId = TenantId(1);
 const ALICE: UserId = UserId(1);
@@ -147,6 +152,117 @@ async fn saga_reminders_and_auto_close_reach_read_model() {
     assert_eq!(closed.len(), 2);
     let Ok(acme) = model.handle(GetTenant(ACME)).await;
     assert_eq!(acme.unwrap().open_tickets, 0);
+}
+
+/// Передаёт уведомления в канал теста.
+struct ChannelNotifier(mpsc::UnboundedSender<Notification>);
+
+impl Notifier for ChannelNotifier {
+    type Error = Infallible;
+
+    async fn send(&self, notification: &Notification) -> Result<(), Infallible> {
+        let _ = self.0.send(*notification);
+        Ok(())
+    }
+}
+
+fn start_notifications(bus: &CommandActorHandle) -> mpsc::UnboundedReceiver<Notification> {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let bus = bus.clone();
+    tokio::spawn(async move {
+        let notifier = ChannelNotifier(sender);
+        run_notifications(&bus, Version(0), &notifier, |_, e| match e {}).await
+    });
+    receiver
+}
+
+async fn next_notification(
+    notifications: &mut mpsc::UnboundedReceiver<Notification>,
+) -> Notification {
+    tokio::time::timeout(Duration::from_secs(5), notifications.recv())
+        .await
+        .expect("a notification arrives")
+        .expect("notifications are running")
+}
+
+#[tokio::test]
+async fn assignment_notifies_agent_and_updates_ticket_status() {
+    let bus = command::spawn(TicketService::new(ManualClock::default()));
+    let model = start_projection(&bus);
+    let mut notifications = start_notifications(&bus);
+    acme_with_alice(&bus).await;
+    create_ticket(&bus).await;
+    let new_ticket = next_notification(&mut notifications).await;
+    assert_eq!(new_ticket.recipient, Recipient::Admins);
+    assert_eq!(new_ticket.kind, NotificationKind::NewTicket);
+
+    let assign = AssignAgentCommand {
+        ticket_id: TicketId(1),
+        agent_id: ALICE,
+    };
+    let version = send(&bus, assign).await;
+
+    let assigned = next_notification(&mut notifications).await;
+    assert_eq!(assigned.recipient, Recipient::Agent(ALICE));
+    assert_eq!(assigned.kind, NotificationKind::Assigned);
+    assert_eq!(assigned.ticket_id, TicketId(1));
+    model.wait_until(version).await;
+    let Ok(ticket) = model.handle(GetTicket(TicketId(1))).await;
+    assert_eq!(ticket.unwrap().status, TicketStatus::InProgress);
+}
+
+/// Оркестратор и хореография не знают друг о друге: сага пишет события, уведомления их читают.
+#[tokio::test]
+async fn saga_reminders_reach_agent_or_admins_through_notifications() {
+    let clock = ManualClock::default();
+    let bus = command::spawn(TicketService::new(clock.clone()));
+    let mut notifications = start_notifications(&bus);
+    tokio::spawn(command::run_ticket_lifecycle(
+        bus.clone(),
+        clock.clone(),
+        Duration::from_millis(1),
+        |e| panic!("the saga command was rejected: {e}"),
+    ));
+    acme_with_alice(&bus).await;
+    create_ticket(&bus).await;
+    create_ticket(&bus).await;
+    let assign = AssignAgentCommand {
+        ticket_id: TicketId(1),
+        agent_id: ALICE,
+    };
+    send(&bus, assign).await;
+    for _ in 0..3 {
+        next_notification(&mut notifications).await;
+    }
+
+    clock.advance(STALE_REMINDER_AFTER_SECS);
+    let stale = NotificationKind::Reminder(ReminderKind::Stale);
+    let first = next_notification(&mut notifications).await;
+    let second = next_notification(&mut notifications).await;
+    assert_eq!(
+        (first.ticket_id, first.recipient, first.kind),
+        (TicketId(1), Recipient::Agent(ALICE), stale)
+    );
+    assert_eq!(
+        (second.ticket_id, second.recipient, second.kind),
+        (TicketId(2), Recipient::Admins, stale)
+    );
+
+    clock.advance(INACTIVITY_TIMEOUT_SECS);
+    let mut closed = Vec::new();
+    while closed.len() < 2 {
+        let notification = next_notification(&mut notifications).await;
+        if notification.kind == NotificationKind::Closed(CloseReason::Inactivity) {
+            closed.push((notification.ticket_id, notification.recipient));
+        }
+    }
+    assert_eq!(
+        closed,
+        [
+            (TicketId(1), Recipient::Agent(ALICE)),
+            (TicketId(2), Recipient::Admins),
+        ]
+    );
 }
 
 /// Запускает политику скидок; все отказы, кроме «скидка не изменилась», копит для проверки.
