@@ -5,21 +5,30 @@ use std::time::Duration;
 
 use leptos::{ev::SubmitEvent, prelude::*, task::spawn_local};
 
-use api::{NotificationDto, Role, TicketDto, TicketStatus};
+use api::{CustomerTier, NotificationDto, Role, TicketDto, TicketStatus};
+use partner_api::{PartnerTicket, PartnerTicketStatus};
 
 use crate::model::http::BrowserHttpClient;
 use crate::model::ticket_api::TicketQuery;
+use crate::partner_view_model::PartnerViewModel;
 use crate::view_model::TicketViewModel;
 
 type Vm = TicketViewModel<BrowserHttpClient>;
+type PartnerVm = PartnerViewModel<BrowserHttpClient>;
 
 /// Сколько дней показывает запрос закрытых тикетов, пока пользователь не ввёл своё.
 const DEFAULT_CLOSED_DAYS: u64 = 7;
 
 const ROLES: [Role; 3] = [Role::Agent, Role::Admin, Role::Customer];
 
+const TIERS: [CustomerTier; 3] = [
+    CustomerTier::Gold,
+    CustomerTier::Silver,
+    CustomerTier::Bronze,
+];
+
 #[component]
-pub fn TicketView(vm: Vm) -> impl IntoView {
+pub fn TicketView(vm: Vm, partner: PartnerVm) -> impl IntoView {
     spawn_local(async move { vm.sync_forever(sleep).await });
     view! {
         <main class="app">
@@ -46,6 +55,7 @@ pub fn TicketView(vm: Vm) -> impl IntoView {
                 </div>
             </div>
             <QueryPanel vm />
+            <PartnerPanel vm partner />
         </main>
     }
 }
@@ -86,6 +96,26 @@ fn CreationPanel(vm: Vm) -> impl IntoView {
                 <form on:submit=move |ev| submit(ev, async move { vm.create_tenant().await })>
                     <h3>"Tenant"</h3>
                     <label>"Name" <input bind:value=forms.tenant_name /></label>
+                    <label>
+                        "CRM tier"
+                        <select on:change=move |ev| {
+                            let value = event_target_value(&ev);
+                            if let Some(tier) = TIERS.into_iter().find(|t| t.to_string() == value) {
+                                forms.tenant_tier.set(tier);
+                            }
+                        }>
+                            {TIERS
+                                .into_iter()
+                                .map(|tier| {
+                                    view! {
+                                        <option selected=move || forms.tenant_tier.get() == tier>
+                                            {tier.to_string()}
+                                        </option>
+                                    }
+                                })
+                                .collect_view()}
+                        </select>
+                    </label>
                     <button type="submit" disabled=move || !vm.can_create_tenant()>
                         "Create tenant"
                     </button>
@@ -296,6 +326,31 @@ fn TicketDetails(vm: Vm) -> impl IntoView {
 
 fn ticket_card(vm: Vm, ticket: TicketDto) -> impl IntoView {
     let tenant = vm.tenant(ticket.tenant_id).map(|t| t.tenant_name);
+    let sla = match ticket.sla_met {
+        None => format!("due {}", format_utc(ticket.sla_due_at)),
+        Some(true) => format!("met (due {})", format_utc(ticket.sla_due_at)),
+        Some(false) => format!("missed (due {})", format_utc(ticket.sla_due_at)),
+    };
+    let resources = ticket
+        .resources
+        .map_or_else(|| "not checked yet".to_owned(), |r| r.to_string());
+    let partner = match (&ticket.partner, ticket.handed_over_at) {
+        (Some(name), Some(at)) => format!("{name}, since {}", format_utc(at)),
+        (Some(name), None) => name.clone(),
+        (None, _) => "—".to_owned(),
+    };
+    let updates = (!ticket.partner_updates.is_empty()).then(|| {
+        view! {
+            <h3>"Partner updates"</h3>
+            <ul class="updates">
+                {ticket
+                    .partner_updates
+                    .into_iter()
+                    .map(|u| view! { <li><span>{u.comment}</span><time>{format_utc(u.at)}</time></li> })
+                    .collect_view()}
+            </ul>
+        }
+    });
     view! {
         <div class="card">
             <div class="card-title">
@@ -320,9 +375,140 @@ fn ticket_card(vm: Vm, ticket: TicketDto) -> impl IntoView {
                 <dd>{optional_time(ticket.closed_at)}</dd>
                 <dt>"Close reason"</dt>
                 <dd>{ticket.close_reason.map_or_else(|| "—".to_owned(), |reason| reason.to_string())}</dd>
+                <dt>"CRM tier"</dt>
+                <dd>{ticket.tier.to_string()}</dd>
+                <dt>"SLA"</dt>
+                <dd class:missed=ticket.sla_met == Some(false)>{sla}</dd>
+                <dt>"ERP resources"</dt>
+                <dd>{resources}</dd>
+                <dt>"Partner"</dt>
+                <dd>{partner}</dd>
             </dl>
+            {updates}
         </div>
     }
+}
+
+/// Панель партнёра: приложение партнёра, которое знает только свой токен и Open-Host Service.
+#[component]
+fn PartnerPanel(vm: Vm, partner: PartnerVm) -> impl IntoView {
+    // У OHS нет своей подписки: перечитываем, когда основной клиент узнал о новых изменениях.
+    Effect::new(move |_| {
+        vm.version();
+        spawn_local(async move { partner.refresh().await });
+    });
+    view! {
+        <section class="panel partner">
+            <h2>"Partner portal"</h2>
+            <p class="hint">
+                "Works only through the partner API /partner/v1. Demo tokens: "
+                <code>"fixit-demo-token"</code>", "<code>"netco-demo-token"</code>
+            </p>
+            {move || {
+                if partner.is_signed_in() {
+                    partner_workspace(partner).into_any()
+                } else {
+                    view! {
+                        <form
+                            class="assign-row"
+                            on:submit=move |ev| submit(ev, async move { partner.sign_in().await })
+                        >
+                            <input placeholder="Partner token" bind:value=partner.token_input />
+                            <button type="submit" disabled=move || !partner.can_sign_in()>
+                                "Sign in"
+                            </button>
+                        </form>
+                    }
+                    .into_any()
+                }
+            }}
+            <p class="error" role="alert">{move || partner.error()}</p>
+        </section>
+    }
+}
+
+fn partner_workspace(partner: PartnerVm) -> impl IntoView {
+    view! {
+        <div class="actions">
+            <button on:click=move |_| partner.sign_out()>"Sign out"</button>
+        </div>
+        {move || {
+            let tickets = partner.tickets();
+            if tickets.is_empty() {
+                return view! { <p class="empty">"No tickets handed to this partner"</p> }.into_any();
+            }
+            view! {
+                <table>
+                    <thead>
+                        <tr>
+                            <th>"#"</th>
+                            <th>"Customer"</th>
+                            <th>"Description"</th>
+                            <th>"Status"</th>
+                            <th>"Due"</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {tickets.into_iter().map(|t| partner_row(partner, t)).collect_view()}
+                    </tbody>
+                </table>
+            }
+            .into_any()
+        }}
+        {move || partner.selected().map(|ticket| partner_ticket_card(partner, ticket))}
+    }
+}
+
+fn partner_row(partner: PartnerVm, ticket: PartnerTicket) -> impl IntoView {
+    let id = ticket.ticket_id;
+    view! {
+        <tr class:selected=move || partner.is_selected(id) on:click=move |_| partner.select(id)>
+            <td>{id}</td>
+            <td>{ticket.customer}</td>
+            <td>{ticket.description}</td>
+            <td>{partner_status(ticket.status)}</td>
+            <td>{format_utc(ticket.due_at)}</td>
+        </tr>
+    }
+}
+
+fn partner_ticket_card(partner: PartnerVm, ticket: PartnerTicket) -> impl IntoView {
+    view! {
+        <div class="card">
+            <h3>{format!("ticket-{} · {}", ticket.ticket_id, ticket.category)}</h3>
+            <ul class="updates">
+                {ticket
+                    .updates
+                    .into_iter()
+                    .map(|u| view! { <li><span>{u.comment}</span><time>{format_utc(u.at)}</time></li> })
+                    .collect_view()}
+            </ul>
+            <label>"Comment" <input bind:value=partner.comment /></label>
+            <div class="actions">
+                <button
+                    on:click=move |_| spawn_local(async move { partner.report_progress().await })
+                    disabled=move || !partner.can_report()
+                >
+                    "Report progress"
+                </button>
+                <button
+                    on:click=move |_| spawn_local(async move { partner.resolve().await })
+                    disabled=move || !partner.can_resolve()
+                >
+                    "Resolve"
+                </button>
+            </div>
+        </div>
+    }
+}
+
+fn partner_status(status: PartnerTicketStatus) -> impl IntoView {
+    let (class, text) = match status {
+        PartnerTicketStatus::Open => ("badge open", "Open"),
+        PartnerTicketStatus::Resolved => ("badge closed", "Resolved"),
+        PartnerTicketStatus::ClosedForInactivity => ("badge closed", "Closed: inactivity"),
+    };
+    view! { <span class=class>{text}</span> }
 }
 
 /// Запросы к read-модели сервера. Результат обновляется сам, когда меняются данные.

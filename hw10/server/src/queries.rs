@@ -29,8 +29,9 @@ where
     answer
 }
 
-fn tickets(views: Vec<TicketView>) -> Json<Vec<TicketDto>> {
-    Json(views.iter().map(dto::ticket_dto).collect())
+fn tickets(state: &AppState, views: Vec<TicketView>) -> Json<Vec<TicketDto>> {
+    let partners = &state.external.partners;
+    Json(views.iter().map(|t| dto::ticket_dto(t, partners)).collect())
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,7 +48,7 @@ pub async fn list_tickets(
         status: params.status.map(dto::ticket_status),
         tenant_id: params.tenant.map(TenantId),
     };
-    tickets(ask(&state, query).await)
+    tickets(&state, ask(&state, query).await)
 }
 
 pub async fn get_ticket(State(state): Shared, Path(id): Path<usize>) -> ApiResult<TicketDto> {
@@ -55,21 +56,27 @@ pub async fn get_ticket(State(state): Shared, Path(id): Path<usize>) -> ApiResul
     let ticket = ask(&state, queries::GetTicket(ticket_id))
         .await
         .ok_or_else(|| ApiError::not_found(format!("{ticket_id} does not exist")))?;
-    Ok(Json(dto::ticket_dto(&ticket)))
+    Ok(Json(dto::ticket_dto(&ticket, &state.external.partners)))
 }
 
 pub async fn active_tickets_of_agent(
     State(state): Shared,
     Path(id): Path<usize>,
 ) -> Json<Vec<TicketDto>> {
-    tickets(ask(&state, queries::ActiveTicketsOfAgent(UserId(id))).await)
+    tickets(
+        &state,
+        ask(&state, queries::ActiveTicketsOfAgent(UserId(id))).await,
+    )
 }
 
 pub async fn unassigned_tickets_of_tenant(
     State(state): Shared,
     Path(id): Path<usize>,
 ) -> Json<Vec<TicketDto>> {
-    tickets(ask(&state, queries::UnassignedTicketsOfTenant(TenantId(id))).await)
+    tickets(
+        &state,
+        ask(&state, queries::UnassignedTicketsOfTenant(TenantId(id))).await,
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,7 +91,10 @@ pub async fn tickets_closed_within(
 ) -> Json<Vec<TicketDto>> {
     let window = params.days.saturating_mul(DAY_SECS);
     let since = Timestamp(state.clock.now().0.saturating_sub(window));
-    tickets(ask(&state, queries::TicketsClosedSince(since)).await)
+    tickets(
+        &state,
+        ask(&state, queries::TicketsClosedSince(since)).await,
+    )
 }
 
 pub async fn list_tenants(State(state): Shared) -> Json<Vec<TenantDto>> {
@@ -144,5 +154,10 @@ pub async fn changes(
         let _ = tokio::time::timeout(state.long_poll, next).await;
     }
     let changes = ask(&state, queries::ChangesSince(since.unwrap_or_default())).await;
-    Json(dto::changes_dto(state.epoch, since.is_none(), &changes))
+    Json(dto::changes_dto(
+        state.epoch,
+        since.is_none(),
+        &changes,
+        &state.external.partners,
+    ))
 }

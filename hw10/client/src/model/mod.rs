@@ -9,6 +9,7 @@ pub mod backoff;
 pub mod http;
 #[cfg(test)]
 pub mod mock_http;
+pub mod partner_portal;
 pub mod replica;
 pub mod ticket_api;
 
@@ -67,10 +68,10 @@ impl TicketRules for TicketDto {
 }
 
 /// Запрос на создание тенанта из того, что ввёл пользователь.
-pub fn new_tenant(name: &str) -> Result<CreateTenantRequest, ValidationError> {
+pub fn new_tenant(name: &str, tier: CustomerTier) -> Result<CreateTenantRequest, ValidationError> {
     Ok(CreateTenantRequest {
         tenant_name: required("tenant name", name)?,
-        tier: CustomerTier::default(),
+        tier,
     })
 }
 
@@ -95,7 +96,7 @@ pub fn new_ticket(
     })
 }
 
-fn required(field: &'static str, value: &str) -> Result<String, ValidationError> {
+pub(crate) fn required(field: &'static str, value: &str) -> Result<String, ValidationError> {
     let value = value.trim();
     if value.is_empty() {
         return Err(ValidationError::Blank(field));
@@ -166,6 +167,13 @@ pub mod fixtures {
             last_activity: 0,
             closes_at: None,
             reminders_sent: 0,
+            tier: api::CustomerTier::Bronze,
+            sla_due_at: 0,
+            sla_met: None,
+            resources: None,
+            partner: None,
+            handed_over_at: None,
+            partner_updates: Vec::new(),
         }
     }
 
@@ -232,7 +240,9 @@ mod tests {
 
     #[test]
     fn creation_requests_keep_trimmed_text() {
-        assert_eq!(new_tenant("  Acme ").unwrap().tenant_name, "Acme");
+        let tenant = new_tenant("  Acme ", CustomerTier::Gold).unwrap();
+        assert_eq!(tenant.tenant_name, "Acme");
+        assert_eq!(tenant.tier, CustomerTier::Gold);
         assert_eq!(
             new_user(" Alice ", Role::Agent),
             Ok(CreateUserRequest {
@@ -253,7 +263,7 @@ mod tests {
     #[test]
     fn blank_text_or_missing_tenant_is_not_a_request() {
         assert_eq!(
-            new_tenant("   "),
+            new_tenant("   ", CustomerTier::Gold),
             Err(ValidationError::Blank("tenant name"))
         );
         assert_eq!(

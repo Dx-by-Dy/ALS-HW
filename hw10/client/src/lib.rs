@@ -2,5 +2,6 @@
 //! `view_model` — состояние формы и команды, `view` — разметка, привязанная к модели представления.
 
 pub mod model;
+pub mod partner_view_model;
 pub mod view;
 pub mod view_model;

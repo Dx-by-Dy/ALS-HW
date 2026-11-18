@@ -15,6 +15,8 @@ pub struct HttpRequest {
     pub path: String,
     /// JSON-тело запроса.
     pub body: Option<String>,
+    /// Значение заголовка `Authorization`.
+    pub authorization: Option<String>,
 }
 
 impl HttpRequest {
@@ -23,6 +25,7 @@ impl HttpRequest {
             method: Method::Get,
             path: path.into(),
             body: None,
+            authorization: None,
         }
     }
 
@@ -31,6 +34,14 @@ impl HttpRequest {
             method: Method::Post,
             path: path.into(),
             body,
+            authorization: None,
+        }
+    }
+
+    pub fn with_authorization(self, value: impl Into<String>) -> Self {
+        Self {
+            authorization: Some(value.into()),
+            ..self
         }
     }
 }
@@ -73,10 +84,13 @@ pub struct BrowserHttpClient;
 
 impl HttpClient for BrowserHttpClient {
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
-        let builder = match request.method {
+        let mut builder = match request.method {
             Method::Get => gloo_net::http::Request::get(&request.path),
             Method::Post => gloo_net::http::Request::post(&request.path),
         };
+        if let Some(authorization) = &request.authorization {
+            builder = builder.header("Authorization", authorization);
+        }
         let sent = match request.body {
             Some(body) => {
                 builder

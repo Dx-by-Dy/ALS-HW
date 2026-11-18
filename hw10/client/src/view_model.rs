@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use api::{
-    CommandAcceptedDto, CreateTenantRequest, CreateTicketRequest, CreateUserRequest,
+    CommandAcceptedDto, CreateTenantRequest, CreateTicketRequest, CreateUserRequest, CustomerTier,
     NotificationDto, Role, TenantDto, TicketDto, UserDto,
 };
 use leptos::prelude::*;
@@ -27,6 +27,8 @@ use crate::model::{self, TicketRules, ValidationError};
 #[derive(Clone, Copy)]
 pub struct CreationForms {
     pub tenant_name: RwSignal<String>,
+    /// С каким уровнем завести клиента в CRM.
+    pub tenant_tier: RwSignal<CustomerTier>,
     pub user_name: RwSignal<String>,
     pub user_role: RwSignal<Role>,
     pub ticket_category: RwSignal<String>,
@@ -38,6 +40,7 @@ impl CreationForms {
     fn new() -> Self {
         Self {
             tenant_name: RwSignal::new(String::new()),
+            tenant_tier: RwSignal::new(CustomerTier::default()),
             user_name: RwSignal::new(String::new()),
             // Клиенты в системе пока ничего не делают, а без агента нельзя взять тикет в работу.
             user_role: RwSignal::new(Role::Agent),
@@ -244,7 +247,10 @@ impl<H: HttpClient + Send + Sync + 'static> TicketViewModel<H> {
     }
 
     fn tenant_request(&self) -> Result<CreateTenantRequest, ValidationError> {
-        self.forms.tenant_name.with(|name| model::new_tenant(name))
+        let tier = self.forms.tenant_tier.get();
+        self.forms
+            .tenant_name
+            .with(|name| model::new_tenant(name, tier))
     }
 
     fn user_request(&self) -> Result<CreateUserRequest, ValidationError> {
@@ -801,6 +807,7 @@ mod tests {
         assert!(!vm.can_create_tenant());
 
         vm.forms.tenant_name.set("  Acme ".to_owned());
+        vm.forms.tenant_tier.set(CustomerTier::Gold);
         assert!(vm.can_create_tenant());
         http.respond_json(200, &CommandAcceptedDto { version: 1 });
         block_on(vm.create_tenant());
@@ -809,7 +816,7 @@ mod tests {
         assert_eq!(request.path, "/api/tenants");
         assert_eq!(
             request.body.as_deref(),
-            Some(r#"{"tenant_name":"Acme","tier":"Bronze"}"#)
+            Some(r#"{"tenant_name":"Acme","tier":"Gold"}"#)
         );
         assert_eq!(vm.forms.tenant_name.get(), "");
         // Тенант появится только из потока изменений, до тех пор модель занята.

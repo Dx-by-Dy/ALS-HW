@@ -1,14 +1,16 @@
 //! Перевод моделей представления в DTO контракта `api` и обратно.
 
 use api::{
-    ChangesDto, CloseReason, CustomerTier, NotificationDto, NotificationKind, Recipient,
-    ReminderKind, Role, TenantDto, TicketDto, TicketStatus, UserDto,
+    ChangesDto, CloseReason, CustomerTier, NotificationDto, NotificationKind, PartnerUpdateDto,
+    Recipient, ReminderKind, ResourceAvailability, Role, TenantDto, TicketDto, TicketStatus,
+    UserDto,
 };
 use query::views::{Changes, NotificationView, TenantView, TicketView, UserView};
-use ticketing::application::notifications;
+use ticketing::application::{notifications, partners::PartnerRoster};
 use ticketing::domain::{sla, ticket, user};
 
-pub fn ticket_dto(ticket: &TicketView) -> TicketDto {
+/// Тикет для внутреннего API. Имя партнёра берётся из справочника `partners`.
+pub fn ticket_dto(ticket: &TicketView, partners: &PartnerRoster) -> TicketDto {
     TicketDto {
         ticket_id: ticket.ticket_id.0,
         category: ticket.category.clone(),
@@ -26,6 +28,31 @@ pub fn ticket_dto(ticket: &TicketView) -> TicketDto {
         last_activity: ticket.last_activity.0,
         closes_at: ticket.closes_at().map(|at| at.0),
         reminders_sent: ticket.reminders_sent,
+        tier: match ticket.tier {
+            sla::CustomerTier::Gold => CustomerTier::Gold,
+            sla::CustomerTier::Silver => CustomerTier::Silver,
+            sla::CustomerTier::Bronze => CustomerTier::Bronze,
+        },
+        sla_due_at: ticket.sla.due_at().0,
+        sla_met: ticket.sla_met,
+        resources: ticket.resources.map(|r| match r {
+            ticket::ResourceAvailability::Available => ResourceAvailability::Available,
+            ticket::ResourceAvailability::Unavailable => ResourceAvailability::Unavailable,
+        }),
+        partner: ticket.partner.map(|(partner_id, _)| {
+            partners
+                .get(partner_id)
+                .map_or_else(|| partner_id.to_string(), |p| p.name.clone())
+        }),
+        handed_over_at: ticket.partner.map(|(_, at)| at.0),
+        partner_updates: ticket
+            .partner_updates
+            .iter()
+            .map(|u| PartnerUpdateDto {
+                comment: u.comment.clone(),
+                at: u.at.0,
+            })
+            .collect(),
     }
 }
 
@@ -112,12 +139,21 @@ pub fn tenant_dto(tenant: &TenantView) -> TenantDto {
     }
 }
 
-pub fn changes_dto(epoch: u64, full: bool, changes: &Changes) -> ChangesDto {
+pub fn changes_dto(
+    epoch: u64,
+    full: bool,
+    changes: &Changes,
+    partners: &PartnerRoster,
+) -> ChangesDto {
     ChangesDto {
         epoch,
         version: changes.version.0,
         full,
-        tickets: changes.tickets.iter().map(ticket_dto).collect(),
+        tickets: changes
+            .tickets
+            .iter()
+            .map(|t| ticket_dto(t, partners))
+            .collect(),
         tenants: changes.tenants.iter().map(tenant_dto).collect(),
         users: changes.users.iter().map(user_dto).collect(),
         notifications: changes.notifications.iter().map(notification_dto).collect(),

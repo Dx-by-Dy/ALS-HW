@@ -302,7 +302,7 @@ mod tests {
             http.respond_json(200, &accepted(version));
         }
 
-        let tenant = crate::model::new_tenant("Acme").unwrap();
+        let tenant = crate::model::new_tenant("Acme", api::CustomerTier::Bronze).unwrap();
         assert_eq!(block_on(service.create_tenant(&tenant)), Ok(accepted(1)));
         let user = crate::model::new_user("Alice", Role::Agent).unwrap();
         assert_eq!(block_on(service.create_user(&user)), Ok(accepted(2)));

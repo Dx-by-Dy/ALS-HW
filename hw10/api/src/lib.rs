@@ -216,6 +216,44 @@ pub struct TicketDto {
     pub closes_at: Option<u64>,
     /// Сколько напоминаний отправлено с момента последней активности.
     pub reminders_sent: u32,
+    /// Уровень клиента в CRM на момент создания.
+    pub tier: CustomerTier,
+    /// К какому сроку клиенту обещано решение (SLA), в секундах Unix-времени.
+    pub sla_due_at: u64,
+    /// Уложились ли в SLA; `None`, пока тикет открыт.
+    pub sla_met: Option<bool>,
+    /// Ответ ERP о ресурсах; `None`, пока ресурсы не проверены.
+    pub resources: Option<ResourceAvailability>,
+    /// Имя партнёра, которому передан тикет.
+    pub partner: Option<String>,
+    /// Когда тикет передан партнёру, в секундах Unix-времени.
+    pub handed_over_at: Option<u64>,
+    /// Отчёты партнёра от старых к новым.
+    pub partner_updates: Vec<PartnerUpdateDto>,
+}
+
+/// Хватает ли своих ресурсов на решение тикета — ответ ERP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResourceAvailability {
+    Available,
+    Unavailable,
+}
+
+impl fmt::Display for ResourceAvailability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Available => "in stock",
+            Self::Unavailable => "out of stock",
+        };
+        f.write_str(name)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartnerUpdateDto {
+    pub comment: String,
+    /// Время в секундах Unix-времени.
+    pub at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

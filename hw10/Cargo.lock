@@ -210,6 +210,7 @@ dependencies = [
  "futures",
  "gloo-net",
  "leptos",
+ "partner_api",
  "serde",
  "serde_json",
 ]
