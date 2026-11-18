@@ -3,8 +3,10 @@
 use framework::cqrs::envelope::Version;
 use ticketing::application::notifications::{NotificationKind, Recipient};
 use ticketing::domain::{
+    partner::PartnerId,
+    sla::{CustomerTier, Sla},
     tenant::{DiscountRate, TenantId},
-    ticket::{CloseReason, INACTIVITY_TIMEOUT_SECS, TicketId, TicketStatus},
+    ticket::{CloseReason, INACTIVITY_TIMEOUT_SECS, ResourceAvailability, TicketId, TicketStatus},
     time::Timestamp,
     user::{Role, UserId},
 };
@@ -27,8 +29,26 @@ pub struct TicketView {
     pub last_activity: Timestamp,
     /// Сколько напоминаний отправлено с момента последней активности.
     pub reminders_sent: u32,
+    /// Уровень клиента по данным CRM на момент создания.
+    pub tier: CustomerTier,
+    /// SLA текущего захода: от создания или последнего повторного открытия.
+    pub sla: Sla,
+    /// Уложились ли в SLA; `None`, пока тикет открыт.
+    pub sla_met: Option<bool>,
+    /// Ответ ERP; `None`, пока ресурсы не проверены.
+    pub resources: Option<ResourceAvailability>,
+    /// Партнёр, которому передан тикет, и когда; у закрытого тикета остаётся.
+    pub partner: Option<(PartnerId, Timestamp)>,
+    /// Отчёты партнёра от старых к новым.
+    pub partner_updates: Vec<PartnerUpdateView>,
     /// Версия последнего изменения записи.
     pub version: Version,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartnerUpdateView {
+    pub comment: String,
+    pub at: Timestamp,
 }
 
 impl TicketView {

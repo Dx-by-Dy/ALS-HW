@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
+use std::hash::Hash;
 
 use framework::cqrs::{
     envelope::{Envelope, Version},
@@ -9,6 +10,7 @@ use framework::cqrs::{
 use ticketing::application::notifications::{NotificationPolicy, Recipient};
 use ticketing::domain::{
     DomainEvent,
+    partner::PartnerId,
     tenant::{DiscountRate, TenantEvent, TenantId},
     ticket::{TicketEvent, TicketId, TicketStatus},
     time::Timestamp,
@@ -16,7 +18,9 @@ use ticketing::domain::{
 };
 
 use crate::queries::ListTickets;
-use crate::views::{Changes, NotificationId, NotificationView, TenantView, TicketView, UserView};
+use crate::views::{
+    Changes, NotificationId, NotificationView, PartnerUpdateView, TenantView, TicketView, UserView,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectionError {
@@ -70,6 +74,8 @@ pub(crate) struct State {
     active_by_agent: HashMap<UserId, BTreeSet<TicketId>>,
     /// Все тикеты каждого тенанта.
     by_tenant: HashMap<TenantId, BTreeSet<TicketId>>,
+    /// Тикеты, переданные каждому партнёру.
+    by_partner: HashMap<PartnerId, BTreeSet<TicketId>>,
     /// Закрытые тикеты по времени закрытия — для запросов по диапазону времени.
     closed: BTreeSet<(Timestamp, TicketId)>,
     /// Каждая запись под версией своего последнего изменения — для запроса изменений.
@@ -163,6 +169,12 @@ impl State {
                         close_reason: None,
                         last_activity: e.at,
                         reminders_sent: 0,
+                        tier: e.tier,
+                        sla: e.sla,
+                        sla_met: None,
+                        resources: None,
+                        partner: None,
+                        partner_updates: Vec::new(),
                         version,
                     },
                 );
@@ -211,6 +223,7 @@ impl State {
                 ticket.status = TicketStatus::Closed;
                 ticket.closed_at = Some(e.at);
                 ticket.close_reason = Some(e.reason);
+                ticket.sla_met = Some(e.sla_met);
                 touch(
                     &mut self.changed,
                     Key::Ticket(e.ticket_id),
@@ -237,12 +250,19 @@ impl State {
                 if let Some(closed_at) = ticket.closed_at.take() {
                     self.closed.remove(&(closed_at, e.ticket_id));
                 }
-                // Как и агрегат, открытый заново тикет начинает без агента.
+                // Как и агрегат, открытый заново тикет начинает без агента и без партнёра.
+                if let Some((partner, _)) = ticket.partner.take() {
+                    remove_from(&mut self.by_partner, partner, e.ticket_id);
+                }
                 ticket.status = TicketStatus::Open;
                 ticket.assigned_agent = None;
                 ticket.close_reason = None;
                 ticket.last_activity = e.at;
                 ticket.reminders_sent = 0;
+                ticket.sla = e.sla;
+                ticket.sla_met = None;
+                ticket.resources = None;
+                ticket.partner_updates.clear();
                 touch(
                     &mut self.changed,
                     Key::Ticket(e.ticket_id),
@@ -278,6 +298,10 @@ impl State {
                     .ok_or(ProjectionError::UnknownTicket(e.ticket_id))?;
                 ticket.last_activity = e.at;
                 ticket.reminders_sent = 0;
+                ticket.partner_updates.push(PartnerUpdateView {
+                    comment: e.comment.clone(),
+                    at: e.at,
+                });
                 touch(
                     &mut self.changed,
                     Key::Ticket(e.ticket_id),
@@ -285,8 +309,36 @@ impl State {
                     version,
                 );
             }
-            // Модель представления пока не показывает ни ресурсов, ни партнёра.
-            TicketEvent::ResourcesChecked(_) | TicketEvent::HandedToPartner(_) => {}
+            TicketEvent::ResourcesChecked(e) => {
+                let ticket = self
+                    .tickets
+                    .get_mut(&e.ticket_id)
+                    .ok_or(ProjectionError::UnknownTicket(e.ticket_id))?;
+                ticket.resources = Some(e.availability);
+                touch(
+                    &mut self.changed,
+                    Key::Ticket(e.ticket_id),
+                    &mut ticket.version,
+                    version,
+                );
+            }
+            TicketEvent::HandedToPartner(e) => {
+                let ticket = self
+                    .tickets
+                    .get_mut(&e.ticket_id)
+                    .ok_or(ProjectionError::UnknownTicket(e.ticket_id))?;
+                ticket.partner = Some((e.partner_id, e.at));
+                self.by_partner
+                    .entry(e.partner_id)
+                    .or_default()
+                    .insert(e.ticket_id);
+                touch(
+                    &mut self.changed,
+                    Key::Ticket(e.ticket_id),
+                    &mut ticket.version,
+                    version,
+                );
+            }
         }
         Ok(())
     }
@@ -372,6 +424,11 @@ impl State {
             .collect()
     }
 
+    pub fn tickets_of_partner(&self, partner_id: PartnerId) -> Vec<TicketView> {
+        let ids = self.by_partner.get(&partner_id).into_iter().flatten();
+        ids.map(|id| self.tickets[id].clone()).collect()
+    }
+
     pub fn tickets_closed_since(&self, since: Timestamp) -> Vec<TicketView> {
         self.closed
             .range((since, TicketId(0))..)
@@ -442,11 +499,11 @@ fn touch(
     *record_version = version;
 }
 
-fn remove_from(index: &mut HashMap<UserId, BTreeSet<TicketId>>, agent: UserId, ticket: TicketId) {
-    if let Some(tickets) = index.get_mut(&agent) {
+fn remove_from<K: Eq + Hash>(index: &mut HashMap<K, BTreeSet<TicketId>>, key: K, ticket: TicketId) {
+    if let Some(tickets) = index.get_mut(&key) {
         tickets.remove(&ticket);
         if tickets.is_empty() {
-            index.remove(&agent);
+            index.remove(&key);
         }
     }
 }
@@ -460,9 +517,9 @@ pub(crate) mod tests {
         partner::PartnerId,
         tenant::{DiscountAppliedEvent, TenantRegisteredEvent},
         ticket::{
-            AgentAssignedEvent, CloseReason, INACTIVITY_TIMEOUT_SECS, PartnerProgressReportedEvent,
-            ReminderKind, ReminderSentEvent, TicketClosedEvent, TicketCreatedEvent,
-            TicketReopenedEvent,
+            AgentAssignedEvent, CloseReason, HandedToPartnerEvent, INACTIVITY_TIMEOUT_SECS,
+            PartnerProgressReportedEvent, ReminderKind, ReminderSentEvent, ResourceAvailability,
+            ResourcesCheckedEvent, TicketClosedEvent, TicketCreatedEvent, TicketReopenedEvent,
         },
         user::{Role, UserRegisteredEvent},
     };
@@ -626,6 +683,12 @@ pub(crate) mod tests {
                 close_reason: None,
                 last_activity: Timestamp(10),
                 reminders_sent: 0,
+                tier: CustomerTier::Bronze,
+                sla: Sla::for_tier(CustomerTier::Bronze, Timestamp(10)),
+                sla_met: None,
+                resources: None,
+                partner: None,
+                partner_updates: Vec::new(),
                 version: Version(5),
             })
         );
@@ -872,6 +935,96 @@ pub(crate) mod tests {
             Some(at.plus_secs(INACTIVITY_TIMEOUT_SECS))
         );
         assert_eq!(state.changes_since(Version(6)).tickets, [ticket]);
+    }
+
+    fn resources(ticket: usize, availability: ResourceAvailability) -> DomainEvent {
+        TicketEvent::ResourcesChecked(ResourcesCheckedEvent {
+            ticket_id: TicketId(ticket),
+            availability,
+            at: Timestamp(1),
+        })
+        .into()
+    }
+
+    fn handed(ticket: usize, partner: usize, at: u64) -> DomainEvent {
+        TicketEvent::HandedToPartner(HandedToPartnerEvent {
+            ticket_id: TicketId(ticket),
+            partner_id: PartnerId(partner),
+            at: Timestamp(at),
+        })
+        .into()
+    }
+
+    fn progress(ticket: usize, partner: usize, comment: &str, at: u64) -> DomainEvent {
+        TicketEvent::PartnerProgressReported(PartnerProgressReportedEvent {
+            ticket_id: TicketId(ticket),
+            partner_id: PartnerId(partner),
+            comment: comment.to_owned(),
+            at: Timestamp(at),
+        })
+        .into()
+    }
+
+    #[test]
+    fn partner_sees_only_tickets_handed_to_it() {
+        let state = with([
+            created(1, ACME, 0),
+            created(2, ACME, 0),
+            created(3, GLOBEX, 0),
+            resources(1, ResourceAvailability::Unavailable),
+            resources(2, ResourceAvailability::Available),
+            resources(3, ResourceAvailability::Unavailable),
+            handed(1, 1, 5),
+            handed(3, 2, 6),
+        ]);
+        assert_eq!(ids(&state.tickets_of_partner(PartnerId(1))), [1]);
+        assert_eq!(ids(&state.tickets_of_partner(PartnerId(2))), [3]);
+        assert_eq!(state.tickets_of_partner(PartnerId(3)), []);
+        let first = state.ticket(TicketId(1)).unwrap();
+        assert_eq!(first.resources, Some(ResourceAvailability::Unavailable));
+        assert_eq!(first.partner, Some((PartnerId(1), Timestamp(5))));
+        let second = state.ticket(TicketId(2)).unwrap();
+        assert_eq!(second.resources, Some(ResourceAvailability::Available));
+        assert_eq!(second.partner, None);
+    }
+
+    #[test]
+    fn partner_updates_and_sla_outcome_are_kept_after_closing() {
+        let state = with([
+            created(1, ACME, 0),
+            resources(1, ResourceAvailability::Unavailable),
+            handed(1, 1, 5),
+            progress(1, 1, "Part ordered", 10),
+            progress(1, 1, "Part replaced", 20),
+            closed(1, ACME, 30),
+        ]);
+        let ticket = state.ticket(TicketId(1)).unwrap();
+        let updates: Vec<_> = ticket
+            .partner_updates
+            .iter()
+            .map(|u| (u.comment.as_str(), u.at.0))
+            .collect();
+        assert_eq!(updates, [("Part ordered", 10), ("Part replaced", 20)]);
+        assert_eq!(ticket.sla_met, Some(true));
+        assert_eq!(ids(&state.tickets_of_partner(PartnerId(1))), [1]);
+    }
+
+    #[test]
+    fn reopened_ticket_leaves_partner_and_starts_over() {
+        let state = with([
+            created(1, ACME, 0),
+            resources(1, ResourceAvailability::Unavailable),
+            handed(1, 1, 5),
+            progress(1, 1, "Done", 10),
+            closed(1, ACME, 20),
+            reopened(1, ACME),
+        ]);
+        assert_eq!(state.tickets_of_partner(PartnerId(1)), []);
+        let ticket = state.ticket(TicketId(1)).unwrap();
+        assert_eq!(ticket.partner, None);
+        assert_eq!(ticket.resources, None);
+        assert_eq!(ticket.partner_updates, []);
+        assert_eq!(ticket.sla_met, None);
     }
 
     #[test]

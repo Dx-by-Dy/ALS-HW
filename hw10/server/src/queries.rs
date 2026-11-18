@@ -20,7 +20,7 @@ use crate::{ApiError, ApiResult, AppState, Shared, dto};
 
 const DAY_SECS: u64 = 24 * 60 * 60;
 
-async fn ask<Q>(state: &AppState, query: Q) -> Q::Output
+pub(crate) async fn ask<Q>(state: &AppState, query: Q) -> Q::Output
 where
     Q: ReadQuery,
     ReadModel: QueryHandler<Q, Error = Infallible>,

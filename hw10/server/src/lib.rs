@@ -11,6 +11,7 @@ mod commands;
 mod dto;
 mod error;
 mod notifier;
+mod partner;
 mod queries;
 mod seed;
 mod world;
@@ -39,7 +40,7 @@ use ticketing::domain::{DomainEvent, tenant::TenantError, ticket::TicketError};
 pub use error::ApiError;
 use notifier::LogNotifier;
 pub use seed::seed;
-pub use world::{ExternalSystems, FIXIT, NETCO};
+pub use world::{ExternalSystems, FIXIT, FIXIT_TOKEN, NETCO, NETCO_TOKEN};
 
 type ApiResult<T> = Result<Json<T>, ApiError>;
 type Shared = State<Arc<AppState>>;
@@ -153,6 +154,12 @@ pub fn app<C: Clock + Clone + Send + Sync + 'static>(clock: C, config: Config) -
             get(queries::notifications_of),
         )
         .route("/api/changes", get(queries::changes))
+        .route(partner_api::TICKETS, get(partner::list_tickets))
+        .route("/partner/v1/tickets/{id}", get(partner::get_ticket))
+        .route(
+            "/partner/v1/tickets/{id}/updates",
+            post(partner::post_update),
+        )
         .with_state(state);
     App {
         router,
@@ -992,5 +999,196 @@ mod tests {
             })
             .await;
         assert_eq!(vpn, ResourceAvailability::Available);
+    }
+
+    // --- Open-Host Service для партнёров ---
+
+    use partner_api::{ErrorCode, PartnerError, PartnerTicket, PartnerTicketStatus};
+
+    /// Запрос к Open-Host Service от имени партнёра с токеном `token`.
+    async fn as_partner<T: DeserializeOwned>(
+        app: &TestApp,
+        token: Option<&str>,
+        method: &str,
+        uri: &str,
+        body: Option<&str>,
+    ) -> (StatusCode, T) {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = token {
+            request = request.header(header::AUTHORIZATION, partner_api::bearer(token));
+        }
+        let request = request
+            .body(body.map_or_else(Body::empty, |b| Body::from(b.to_owned())))
+            .unwrap();
+        let response = app.router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// Ждёт, пока партнёру FixIt передадут тикет про принтер из seed.
+    async fn fixit_tickets(app: &TestApp) -> Vec<PartnerTicket> {
+        let wait = async {
+            loop {
+                let (status, tickets): (_, Vec<PartnerTicket>) =
+                    as_partner(app, Some(FIXIT_TOKEN), "GET", partner_api::TICKETS, None).await;
+                assert_eq!(status, StatusCode::OK);
+                if !tickets.is_empty() {
+                    return tickets;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(WAIT, wait)
+            .await
+            .expect("printer ticket was handed to FixIt")
+    }
+
+    fn update(status: &str, comment: &str) -> String {
+        format!(r#"{{"status":"{status}","comment":"{comment}"}}"#)
+    }
+
+    #[tokio::test]
+    async fn partner_sees_only_tickets_handed_to_it() {
+        let app = seeded_app().await;
+        let tickets = fixit_tickets(&app).await;
+        assert_eq!(
+            tickets,
+            [PartnerTicket {
+                ticket_id: 4,
+                category: "Hardware".to_owned(),
+                description: "Printer on floor 3 is offline".to_owned(),
+                customer: "Acme".to_owned(),
+                status: PartnerTicketStatus::Open,
+                handed_over_at: 0,
+                due_at: DAY,
+                closed_at: None,
+                updates: Vec::new(),
+            }]
+        );
+        let (status, one): (_, PartnerTicket) = as_partner(
+            &app,
+            Some(FIXIT_TOKEN),
+            "GET",
+            &partner_api::ticket(4),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(one, tickets[0]);
+
+        let (_, netco): (_, Vec<PartnerTicket>) =
+            as_partner(&app, Some(NETCO_TOKEN), "GET", partner_api::TICKETS, None).await;
+        assert_eq!(netco, []);
+        for (token, ticket) in [(NETCO_TOKEN, 4), (FIXIT_TOKEN, 1), (FIXIT_TOKEN, 99)] {
+            let (status, error): (_, PartnerError) =
+                as_partner(&app, Some(token), "GET", &partner_api::ticket(ticket), None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{token} ticket {ticket}");
+            assert_eq!(error.code, ErrorCode::NotFound);
+        }
+    }
+
+    #[tokio::test]
+    async fn partner_api_requires_a_known_token() {
+        let app = empty_app(NEVER).await;
+        for token in [None, Some("stolen-token")] {
+            let request = Request::builder()
+                .uri(partner_api::TICKETS)
+                .header(
+                    header::AUTHORIZATION,
+                    token.map_or(String::new(), partner_api::bearer),
+                )
+                .body(Body::empty())
+                .unwrap();
+            let response = app.router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{token:?}");
+            assert_eq!(response.headers()[header::WWW_AUTHENTICATE], "Bearer");
+        }
+        let (status, error): (_, PartnerError) =
+            as_partner(&app, None, "GET", partner_api::TICKETS, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(error.code, ErrorCode::Unauthorized);
+    }
+
+    #[tokio::test]
+    async fn partner_reports_progress_and_resolves_ticket() {
+        let app = seeded_app().await;
+        fixit_tickets(&app).await;
+        let uri = partner_api::ticket_updates(4);
+
+        app.clock.advance(2 * DAY);
+        let body = update("in_progress", "Replacement fuser ordered");
+        let (status, ticket): (_, PartnerTicket) =
+            as_partner(&app, Some(FIXIT_TOKEN), "POST", &uri, Some(&body)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ticket.status, PartnerTicketStatus::Open);
+        assert_eq!(ticket.updates.len(), 1);
+        assert_eq!(ticket.updates[0].at, 2 * DAY);
+        // Отчёт партнёра — активность: автозакрытие отодвинулось.
+        let internal: TicketDto = app.get(&api::ticket(4)).await;
+        assert_eq!(internal.closes_at, Some(2 * DAY + INACTIVITY_TIMEOUT_SECS));
+
+        let (status, error): (_, PartnerError) = as_partner(
+            &app,
+            Some(FIXIT_TOKEN),
+            "POST",
+            &uri,
+            Some(&update("in_progress", " ")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.code, ErrorCode::Invalid);
+
+        let body = update("resolved", "Fuser replaced, printer works");
+        let (status, ticket): (_, PartnerTicket) =
+            as_partner(&app, Some(FIXIT_TOKEN), "POST", &uri, Some(&body)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ticket.status, PartnerTicketStatus::Resolved);
+        assert_eq!(ticket.closed_at, Some(2 * DAY));
+        assert_eq!(ticket.updates.len(), 2);
+        let internal: TicketDto = app.get(&api::ticket(4)).await;
+        assert_eq!(internal.status, TicketStatus::Closed);
+        assert_eq!(internal.close_reason, Some(CloseReason::Resolved));
+
+        let (status, error): (_, PartnerError) = as_partner(
+            &app,
+            Some(FIXIT_TOKEN),
+            "POST",
+            &uri,
+            Some(&update("resolved", "")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error.code, ErrorCode::Closed);
+
+        // Клиент узнал о решении через CRM: срок Gold — сутки, решили за двое.
+        let history = app.wait_for_crm_history(11).await;
+        let closing = history
+            .iter()
+            .find(|a| a.case_ref == "TKT-4" && a.case_stat == "RESOLVED")
+            .expect("customer is told about the resolution");
+        assert_eq!(closing.sla_met_flag, "N");
+    }
+
+    #[tokio::test]
+    async fn other_partner_cannot_report_on_foreign_ticket() {
+        let app = seeded_app().await;
+        fixit_tickets(&app).await;
+        let body = update("resolved", "Not ours, but closing");
+        let (status, error): (_, PartnerError) = as_partner(
+            &app,
+            Some(NETCO_TOKEN),
+            "POST",
+            &partner_api::ticket_updates(4),
+            Some(&body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(error.code, ErrorCode::NotFound);
+        let internal: TicketDto = app.get(&api::ticket(4)).await;
+        assert_eq!(internal.status, TicketStatus::Open);
     }
 }

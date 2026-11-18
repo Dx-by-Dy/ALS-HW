@@ -11,7 +11,7 @@ use tokio::sync::watch;
 
 use crate::queries::{
     ActiveTicketsOfAgent, ChangesSince, GetTenant, GetTicket, ListTenants, ListTickets, ListUsers,
-    NotificationsOf, TicketsClosedSince, UnassignedTicketsOfTenant,
+    NotificationsOf, TicketsClosedSince, TicketsOfPartner, UnassignedTicketsOfTenant,
 };
 use crate::state::{ProjectionError, State};
 
@@ -107,6 +107,7 @@ impl_query_handler! {
     ActiveTicketsOfAgent => |state, query| state.active_tickets_of_agent(query.0);
     UnassignedTicketsOfTenant => |state, query| state.unassigned_tickets_of_tenant(query.0);
     TicketsClosedSince => |state, query| state.tickets_closed_since(query.0);
+    TicketsOfPartner => |state, query| state.tickets_of_partner(query.0);
     GetTenant => |state, query| state.tenant(query.0);
     ListTenants => |state, _query| state.tenants();
     ListUsers => |state, _query| state.users();

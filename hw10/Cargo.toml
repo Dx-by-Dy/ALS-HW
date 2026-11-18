@@ -8,6 +8,7 @@ members = [
     "framework",
     "integration",
     "kernel",
+    "partner_api",
     "query",
     "server",
     "ticketing",

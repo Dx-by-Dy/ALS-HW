@@ -2,6 +2,7 @@
 
 use framework::cqrs::{envelope::Version, query::Query};
 use ticketing::domain::{
+    partner::PartnerId,
     tenant::TenantId,
     ticket::{TicketId, TicketStatus},
     time::Timestamp,
@@ -34,6 +35,11 @@ pub struct UnassignedTicketsOfTenant(pub TenantId);
 /// «За последние 7 дней» — это `since = now - 7 дней`: текущее время задаёт вызывающий.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TicketsClosedSince(pub Timestamp);
+
+/// Тикеты, переданные партнёру, по возрастанию номера — и открытые, и закрытые.
+/// Тикет, открытый заново, партнёру больше не принадлежит, пока его не передадут снова.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TicketsOfPartner(pub PartnerId);
 
 /// Тенант по номеру.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +79,10 @@ impl Query for UnassignedTicketsOfTenant {
 }
 
 impl Query for TicketsClosedSince {
+    type Output = Vec<TicketView>;
+}
+
+impl Query for TicketsOfPartner {
     type Output = Vec<TicketView>;
 }
 

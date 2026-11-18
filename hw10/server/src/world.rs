@@ -5,6 +5,7 @@
 //! в CRM уже был бы; в демо его заводит сервер, когда регистрирует тенанта, — так,
 //! как это сделал бы менеджер CRM.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use external::{crm::InMemoryCrm, erp::InMemoryErp};
@@ -23,11 +24,17 @@ pub const FIXIT: PartnerId = PartnerId(1);
 /// Партнёр по сетям: забирает тикеты `Network`.
 pub const NETCO: PartnerId = PartnerId(2);
 
+/// Демо-токены, с которыми партнёры обращаются к Open-Host Service.
+pub const FIXIT_TOKEN: &str = "fixit-demo-token";
+pub const NETCO_TOKEN: &str = "netco-demo-token";
+
 #[derive(Debug, Clone)]
 pub struct ExternalSystems {
     pub crm: Arc<InMemoryCrm>,
     pub erp: Arc<InMemoryErp>,
     pub partners: PartnerRoster,
+    /// Токен доступа к Open-Host Service → партнёр.
+    pub partner_tokens: HashMap<String, PartnerId>,
 }
 
 impl ExternalSystems {
@@ -43,6 +50,10 @@ impl ExternalSystems {
             partners: PartnerRoster::new(vec![
                 Partner::new(FIXIT, "FixIt Hardware", &["Hardware"]),
                 Partner::new(NETCO, "NetCo", &["Network"]),
+            ]),
+            partner_tokens: HashMap::from([
+                (FIXIT_TOKEN.to_owned(), FIXIT),
+                (NETCO_TOKEN.to_owned(), NETCO),
             ]),
         }
     }

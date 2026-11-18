@@ -9,6 +9,7 @@ command = { path = "../command" }
 external = { path = "../external" }
 framework = { path = "../framework" }
 integration = { path = "../integration" }
+partner_api = { path = "../partner_api" }
 query = { path = "../query" }
 ticketing = { path = "../ticketing" }
 axum = "0.8"
