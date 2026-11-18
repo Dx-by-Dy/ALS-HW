@@ -1,7 +1,8 @@
 use std::fmt;
 
 use super::{CLOSING_SOON_REMINDER_AFTER_SECS, STALE_REMINDER_AFTER_SECS, TicketId};
-use crate::domain::{tenant::TenantId, time::Timestamp, user::User};
+use crate::domain::{partner::PartnerId, tenant::TenantId, time::Timestamp, user::User};
+use kernel::sla::CustomerTier;
 
 /// Команды агрегата `Ticket`.
 ///
@@ -14,6 +15,8 @@ pub enum TicketCommand {
         category: String,
         description: String,
         tenant_id: TenantId,
+        /// Уровень клиента: его заранее узнаёт у CRM слой приложения.
+        tier: CustomerTier,
         at: Timestamp,
     },
     AssignAgent {
@@ -33,6 +36,45 @@ pub enum TicketCommand {
         kind: ReminderKind,
         at: Timestamp,
     },
+    /// Записать, хватает ли ресурсов на решение: ответ ERP.
+    RecordResourceCheck {
+        availability: ResourceAvailability,
+        at: Timestamp,
+    },
+    /// Передать тикет партнёру, потому что своих ресурсов нет.
+    HandToPartner {
+        partner_id: PartnerId,
+        at: Timestamp,
+    },
+    /// Партнёр сообщает о ходе работы.
+    ReportPartnerProgress {
+        partner_id: PartnerId,
+        comment: String,
+        at: Timestamp,
+    },
+    /// Партнёр сообщает, что проблема решена: тикет закрывается.
+    ResolveByPartner {
+        partner_id: PartnerId,
+        at: Timestamp,
+    },
+}
+
+/// Хватает ли ресурсов, чтобы решить тикет своими силами.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceAvailability {
+    Available,
+    /// Своих ресурсов нет: решать будет партнёр.
+    Unavailable,
+}
+
+impl fmt::Display for ResourceAvailability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Available => "available",
+            Self::Unavailable => "unavailable",
+        };
+        f.write_str(name)
+    }
 }
 
 /// Вид напоминания. Варианты идут в том порядке, в каком наступают их сроки.

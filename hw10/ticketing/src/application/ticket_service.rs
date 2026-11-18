@@ -4,7 +4,9 @@ use super::{
     clock::Clock,
     commands::{
         ApplyDiscountCommand, AssignAgentCommand, CloseTicketCommand, CreateTicketCommand,
-        RegisterTenantCommand, RegisterUserCommand, ReopenTicketCommand, SendReminderCommand,
+        HandToPartnerCommand, RecordResourceCheckCommand, RegisterTenantCommand,
+        RegisterUserCommand, ReopenTicketCommand, ReportPartnerProgressCommand,
+        ResolveByPartnerCommand, SendReminderCommand,
     },
     error::ServiceError,
     open_tickets::OpenTickets,
@@ -116,6 +118,7 @@ impl<C: Clock> TicketService<C> {
             category: command.category,
             description: command.description,
             tenant_id: command.tenant_id,
+            tier: command.tier,
             at: self.clock.now(),
         };
         let event = self.execute_ticket(ticket_id, command).await?;
@@ -166,6 +169,51 @@ impl<C: Clock> TicketService<C> {
             at: self.clock.now(),
         };
         self.execute_ticket(command.ticket_id, remind).await
+    }
+
+    pub async fn handle_record_resource_check(
+        &mut self,
+        command: RecordResourceCheckCommand,
+    ) -> Result<TicketEvent, ServiceError> {
+        let record = TicketCommand::RecordResourceCheck {
+            availability: command.availability,
+            at: self.clock.now(),
+        };
+        self.execute_ticket(command.ticket_id, record).await
+    }
+
+    pub async fn handle_hand_to_partner(
+        &mut self,
+        command: HandToPartnerCommand,
+    ) -> Result<TicketEvent, ServiceError> {
+        let hand = TicketCommand::HandToPartner {
+            partner_id: command.partner_id,
+            at: self.clock.now(),
+        };
+        self.execute_ticket(command.ticket_id, hand).await
+    }
+
+    pub async fn handle_report_partner_progress(
+        &mut self,
+        command: ReportPartnerProgressCommand,
+    ) -> Result<TicketEvent, ServiceError> {
+        let report = TicketCommand::ReportPartnerProgress {
+            partner_id: command.partner_id,
+            comment: command.comment,
+            at: self.clock.now(),
+        };
+        self.execute_ticket(command.ticket_id, report).await
+    }
+
+    pub async fn handle_resolve_by_partner(
+        &mut self,
+        command: ResolveByPartnerCommand,
+    ) -> Result<TicketEvent, ServiceError> {
+        let resolve = TicketCommand::ResolveByPartner {
+            partner_id: command.partner_id,
+            at: self.clock.now(),
+        };
+        self.execute_ticket(command.ticket_id, resolve).await
     }
 
     /// Пересчитывает скидку тенанта по текущему числу его открытых тикетов.
@@ -257,6 +305,7 @@ mod tests {
         time::Timestamp,
         user::Role,
     };
+    use kernel::sla::{CustomerTier, Sla};
 
     const DAY: u64 = 24 * 60 * 60;
 
@@ -297,8 +346,12 @@ mod tests {
 
     impl Fixture {
         async fn create_ticket(&mut self) -> TicketId {
-            let command =
-                CreateTicketCommand::new("Technical Issue", "Problem description", self.tenant_id);
+            let command = CreateTicketCommand::new(
+                "Technical Issue",
+                "Problem description",
+                self.tenant_id,
+                CustomerTier::Bronze,
+            );
             self.service
                 .handle_create_ticket(command)
                 .await
@@ -341,8 +394,12 @@ mod tests {
     async fn create_ticket_emits_created_event() {
         let mut f = fixture().await;
         f.clock.advance(10);
-        let command =
-            CreateTicketCommand::new("Technical Issue", "Problem description", f.tenant_id);
+        let command = CreateTicketCommand::new(
+            "Technical Issue",
+            "Problem description",
+            f.tenant_id,
+            CustomerTier::Bronze,
+        );
         assert_eq!(
             f.service.handle_create_ticket(command).await,
             Ok(TicketEvent::Created(TicketCreatedEvent {
@@ -350,6 +407,8 @@ mod tests {
                 category: "Technical Issue".to_owned(),
                 description: "Problem description".to_owned(),
                 tenant_id: f.tenant_id,
+                tier: CustomerTier::Bronze,
+                sla: Sla::for_tier(CustomerTier::Bronze, Timestamp(10)),
                 at: Timestamp(10),
             }))
         );
@@ -366,7 +425,12 @@ mod tests {
     #[tokio::test]
     async fn ticket_for_unknown_tenant_is_rejected() {
         let mut f = fixture().await;
-        let command = CreateTicketCommand::new("Billing", "Wrong invoice", TenantId(99));
+        let command = CreateTicketCommand::new(
+            "Billing",
+            "Wrong invoice",
+            TenantId(99),
+            CustomerTier::Bronze,
+        );
         assert_eq!(
             f.service.handle_create_ticket(command).await,
             Err(ServiceError::UnknownTenant(TenantId(99)))
@@ -376,7 +440,7 @@ mod tests {
     #[tokio::test]
     async fn rejected_ticket_does_not_consume_id() {
         let mut f = fixture().await;
-        let command = CreateTicketCommand::new("Billing", "  ", f.tenant_id);
+        let command = CreateTicketCommand::new("Billing", "  ", f.tenant_id, CustomerTier::Bronze);
         assert_eq!(
             f.service.handle_create_ticket(command).await,
             Err(ServiceError::Ticket(TicketError::EmptyDescription))
@@ -446,6 +510,7 @@ mod tests {
                 tenant_id: f.tenant_id,
                 agent_id: None,
                 reason: CloseReason::Resolved,
+                sla_met: true,
                 at: Timestamp(0)
             }))
         );
@@ -479,6 +544,7 @@ mod tests {
             Ok(TicketEvent::Reopened(TicketReopenedEvent {
                 ticket_id,
                 tenant_id: f.tenant_id,
+                sla: Sla::for_tier(CustomerTier::Bronze, Timestamp(60)),
                 at: Timestamp(60),
             }))
         );
@@ -618,7 +684,12 @@ mod tests {
             .tenant_id();
         for _ in 0..=DiscountRate::THRESHOLD {
             f.service
-                .handle_create_ticket(CreateTicketCommand::new("Billing", "Invoice", other))
+                .handle_create_ticket(CreateTicketCommand::new(
+                    "Billing",
+                    "Invoice",
+                    other,
+                    CustomerTier::Bronze,
+                ))
                 .await
                 .unwrap();
         }
@@ -741,5 +812,65 @@ mod tests {
             Err(ServiceError::Ticket(TicketError::NotFound))
         );
         assert!(f.service.take_outbox().is_empty());
+    }
+
+    #[tokio::test]
+    async fn partner_path_runs_through_the_service() {
+        use crate::domain::{partner::PartnerId, ticket::ResourceAvailability};
+
+        let mut f = fixture().await;
+        let gold =
+            CreateTicketCommand::new("Hardware", "Disk failed", f.tenant_id, CustomerTier::Gold);
+        let ticket_id = f
+            .service
+            .handle_create_ticket(gold)
+            .await
+            .unwrap()
+            .ticket_id();
+        f.service.take_outbox();
+        let partner_id = PartnerId(1);
+
+        f.service
+            .handle_record_resource_check(RecordResourceCheckCommand {
+                ticket_id,
+                availability: ResourceAvailability::Unavailable,
+            })
+            .await
+            .unwrap();
+        f.service
+            .handle_hand_to_partner(HandToPartnerCommand {
+                ticket_id,
+                partner_id,
+            })
+            .await
+            .unwrap();
+        f.clock.advance(DAY / 2);
+        f.service
+            .handle_report_partner_progress(ReportPartnerProgressCommand {
+                ticket_id,
+                partner_id,
+                comment: "Disk replaced".to_owned(),
+            })
+            .await
+            .unwrap();
+        let closed = f
+            .service
+            .handle_resolve_by_partner(ResolveByPartnerCommand {
+                ticket_id,
+                partner_id,
+            })
+            .await
+            .unwrap();
+
+        let TicketEvent::Closed(closed) = closed else {
+            panic!("partner resolution closes the ticket");
+        };
+        assert!(closed.sla_met, "Gold SLA is one day, resolved in half");
+        let ticket = f.service.ticket(ticket_id).await.unwrap().unwrap();
+        assert_eq!(ticket.status(), TicketStatus::Closed);
+        assert_eq!(ticket.partner(), Some(partner_id));
+        assert_eq!(ticket.last_activity(), Timestamp(DAY / 2));
+        assert_eq!(f.service.take_outbox().len(), 4);
+        assert_eq!(f.service.open_tickets_count(f.tenant_id), 0);
     }
 }

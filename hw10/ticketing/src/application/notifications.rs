@@ -133,6 +133,10 @@ impl Policy<DomainEvent> for NotificationPolicy {
                 };
                 vec![notify(recipient, NotificationKind::Closed(e.reason), e.at)]
             }
+            // Шаги интеграции с ERP и партнёрами сотрудникам о себе не сообщают.
+            TicketEvent::ResourcesChecked(_)
+            | TicketEvent::HandedToPartner(_)
+            | TicketEvent::PartnerProgressReported(_) => Vec::new(),
         }
     }
 }
@@ -187,6 +191,7 @@ mod tests {
             TicketReopenedEvent,
         },
     };
+    use kernel::sla::{CustomerTier, Sla};
 
     const TICKET: TicketId = TicketId(7);
     const ALICE: UserId = UserId(1);
@@ -212,6 +217,8 @@ mod tests {
             category: "Billing".to_owned(),
             description: "Invoice".to_owned(),
             tenant_id: TenantId(1),
+            tier: CustomerTier::Bronze,
+            sla: Sla::for_tier(CustomerTier::Bronze, AT),
             at: AT,
         })
     }
@@ -231,6 +238,7 @@ mod tests {
             tenant_id: TenantId(1),
             agent_id,
             reason,
+            sla_met: true,
             at: AT,
         })
     }
@@ -253,6 +261,7 @@ mod tests {
         let reopened = TicketEvent::Reopened(TicketReopenedEvent {
             ticket_id: TICKET,
             tenant_id: TenantId(1),
+            sla: Sla::for_tier(CustomerTier::Bronze, AT),
             at: AT,
         });
         assert_eq!(

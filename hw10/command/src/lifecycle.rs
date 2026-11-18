@@ -88,6 +88,7 @@ mod tests {
         },
         ticket_service::TicketService,
     };
+    use ticketing::domain::sla::CustomerTier;
     use ticketing::domain::{
         DomainEvent,
         tenant::TenantId,
@@ -146,7 +147,12 @@ mod tests {
     impl Scenario {
         async fn create_ticket(&self) {
             self.bus
-                .send(CreateTicketCommand::new("Billing", "Invoice", TenantId(1)))
+                .send(CreateTicketCommand::new(
+                    "Billing",
+                    "Invoice",
+                    TenantId(1),
+                    CustomerTier::Bronze,
+                ))
                 .await
                 .unwrap();
         }
@@ -343,9 +349,14 @@ mod tests {
         let bus = crate::spawn(TicketService::new(clock.clone()));
         bus.send(RegisterTenantCommand::new("Acme")).await.unwrap();
         for _ in 0..2 {
-            bus.send(CreateTicketCommand::new("Billing", "Invoice", TenantId(1)))
-                .await
-                .unwrap();
+            bus.send(CreateTicketCommand::new(
+                "Billing",
+                "Invoice",
+                TenantId(1),
+                CustomerTier::Bronze,
+            ))
+            .await
+            .unwrap();
         }
         let mut events = bus.subscribe(Version(3)).await.unwrap();
         clock.advance(3 * DAY);
@@ -380,9 +391,14 @@ mod tests {
         let clock = ManualClock::default();
         let bus = crate::spawn(TicketService::new(clock.clone()));
         bus.send(RegisterTenantCommand::new("Acme")).await.unwrap();
-        bus.send(CreateTicketCommand::new("Billing", "Invoice", TenantId(1)))
-            .await
-            .unwrap();
+        bus.send(CreateTicketCommand::new(
+            "Billing",
+            "Invoice",
+            TenantId(1),
+            CustomerTier::Bronze,
+        ))
+        .await
+        .unwrap();
         let mut events = bus.subscribe(Version(2)).await.unwrap();
         clock.advance(10 * DAY);
 

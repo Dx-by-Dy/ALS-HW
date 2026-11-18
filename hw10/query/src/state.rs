@@ -270,6 +270,23 @@ impl State {
                     version,
                 );
             }
+            // Как и агрегат, отчёт партнёра считаем активностью: сроки сдвигаются.
+            TicketEvent::PartnerProgressReported(e) => {
+                let ticket = self
+                    .tickets
+                    .get_mut(&e.ticket_id)
+                    .ok_or(ProjectionError::UnknownTicket(e.ticket_id))?;
+                ticket.last_activity = e.at;
+                ticket.reminders_sent = 0;
+                touch(
+                    &mut self.changed,
+                    Key::Ticket(e.ticket_id),
+                    &mut ticket.version,
+                    version,
+                );
+            }
+            // Модель представления пока не показывает ни ресурсов, ни партнёра.
+            TicketEvent::ResourcesChecked(_) | TicketEvent::HandedToPartner(_) => {}
         }
         Ok(())
     }
@@ -438,11 +455,14 @@ fn remove_from(index: &mut HashMap<UserId, BTreeSet<TicketId>>, agent: UserId, t
 pub(crate) mod tests {
     use super::*;
     use ticketing::application::notifications::NotificationKind;
+    use ticketing::domain::sla::{CustomerTier, Sla};
     use ticketing::domain::{
+        partner::PartnerId,
         tenant::{DiscountAppliedEvent, TenantRegisteredEvent},
         ticket::{
-            AgentAssignedEvent, CloseReason, INACTIVITY_TIMEOUT_SECS, ReminderKind,
-            ReminderSentEvent, TicketClosedEvent, TicketCreatedEvent, TicketReopenedEvent,
+            AgentAssignedEvent, CloseReason, INACTIVITY_TIMEOUT_SECS, PartnerProgressReportedEvent,
+            ReminderKind, ReminderSentEvent, TicketClosedEvent, TicketCreatedEvent,
+            TicketReopenedEvent,
         },
         user::{Role, UserRegisteredEvent},
     };
@@ -475,6 +495,8 @@ pub(crate) mod tests {
             category: "Billing".to_owned(),
             description: format!("Ticket {ticket}"),
             tenant_id,
+            tier: CustomerTier::Bronze,
+            sla: Sla::for_tier(CustomerTier::Bronze, Timestamp(at)),
             at: Timestamp(at),
         })
         .into()
@@ -496,6 +518,7 @@ pub(crate) mod tests {
             tenant_id,
             agent_id: None,
             reason: CloseReason::Resolved,
+            sla_met: true,
             at: Timestamp(at),
         })
         .into()
@@ -515,6 +538,7 @@ pub(crate) mod tests {
         TicketEvent::Reopened(TicketReopenedEvent {
             ticket_id: TicketId(ticket),
             tenant_id,
+            sla: Sla::for_tier(CustomerTier::Bronze, Timestamp(0)),
             at: Timestamp(0),
         })
         .into()
@@ -826,6 +850,27 @@ pub(crate) mod tests {
             reopened(1, ACME),
         ]);
         assert_eq!(reopened.ticket(TicketId(1)).unwrap().reminders_sent, 0);
+    }
+
+    #[test]
+    fn partner_progress_is_activity_and_moves_auto_close() {
+        let at = Timestamp(500);
+        let progress = TicketEvent::PartnerProgressReported(PartnerProgressReportedEvent {
+            ticket_id: TicketId(1),
+            partner_id: PartnerId(1),
+            comment: "Part shipped".to_owned(),
+            at,
+        })
+        .into();
+        let state = with([created(1, ACME, 0), reminder(1), progress]);
+        let ticket = state.ticket(TicketId(1)).unwrap();
+        assert_eq!(ticket.last_activity, at);
+        assert_eq!(ticket.reminders_sent, 0);
+        assert_eq!(
+            ticket.closes_at(),
+            Some(at.plus_secs(INACTIVITY_TIMEOUT_SECS))
+        );
+        assert_eq!(state.changes_since(Version(6)).tickets, [ticket]);
     }
 
     #[test]

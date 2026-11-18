@@ -4,21 +4,23 @@ mod events;
 
 use std::fmt;
 
-pub use command::{CloseReason, ReminderKind, TicketCommand};
+pub use command::{CloseReason, ReminderKind, ResourceAvailability, TicketCommand};
 pub use error::TicketError;
 pub use events::{
-    AgentAssignedEvent, ReminderSentEvent, TicketClosedEvent, TicketCreatedEvent, TicketEvent,
-    TicketReopenedEvent,
+    AgentAssignedEvent, HandedToPartnerEvent, PartnerProgressReportedEvent, ReminderSentEvent,
+    ResourcesCheckedEvent, TicketClosedEvent, TicketCreatedEvent, TicketEvent, TicketReopenedEvent,
 };
 /// Статус и правила переходов — из Shared Kernel: их же соблюдает CRM.
 pub use kernel::status::TicketStatus;
 
 use crate::domain::{
+    partner::PartnerId,
     tenant::TenantId,
     time::{DAY_SECS, Timestamp},
     user::{Role, User, UserId},
 };
 use framework::event_sourcing::{event_store::StreamId, lifecycle::Lifecycle};
+use kernel::sla::{CustomerTier, Sla};
 
 /// Сколько тикет может простоять без активности, прежде чем его закроют: 10 дней.
 pub const INACTIVITY_TIMEOUT_SECS: u64 = 10 * DAY_SECS;
@@ -57,19 +59,27 @@ pub struct Ticket {
     status: TicketStatus,
     assigned_agent: Option<UserId>,
     tenant: TenantId,
+    tier: CustomerTier,
+    /// SLA текущего захода: от создания или последнего повторного открытия.
+    sla: Sla,
     /// Время последнего изменения: от него отсчитывается неактивность.
     last_activity: Timestamp,
     /// Самое позднее напоминание, отправленное с момента последней активности.
     last_reminder: Option<ReminderKind>,
+    /// Ответ ERP; `None`, пока ресурсы не проверены.
+    resources: Option<ResourceAvailability>,
+    /// Партнёр, которому передан тикет.
+    partner: Option<PartnerId>,
 }
 
 impl Ticket {
-    /// Решение о создании тикета.
+    /// Решение о создании тикета. SLA начинает отсчёт с момента создания.
     pub fn create(
         ticket_id: TicketId,
         category: &str,
         description: &str,
         tenant_id: TenantId,
+        tier: CustomerTier,
         at: Timestamp,
     ) -> Result<TicketEvent, TicketError> {
         let description = description.trim();
@@ -85,6 +95,8 @@ impl Ticket {
             category: category.to_owned(),
             description: description.to_owned(),
             tenant_id,
+            tier,
+            sla: Sla::for_tier(tier, at),
             at,
         }))
     }
@@ -122,17 +134,19 @@ impl Ticket {
             tenant_id: self.tenant,
             agent_id: self.assigned_agent,
             reason,
+            sla_met: !self.sla.is_overdue(at),
             at,
         }))
     }
 
-    /// Решение об открытии закрытого тикета. Он начинает жизнь заново: без агента
-    /// и с новым отсчётом неактивности.
+    /// Решение об открытии закрытого тикета. Он начинает жизнь заново: без агента,
+    /// без партнёра, с новым SLA и новым отсчётом неактивности.
     pub fn reopen(&self, at: Timestamp) -> Result<TicketEvent, TicketError> {
         self.ensure_can_become(TicketStatus::Open)?;
         Ok(TicketEvent::Reopened(TicketReopenedEvent {
             ticket_id: self.ticket_id,
             tenant_id: self.tenant,
+            sla: Sla::for_tier(self.tier, at),
             at,
         }))
     }
@@ -158,6 +172,79 @@ impl Ticket {
             kind,
             at,
         }))
+    }
+
+    /// Решение о записи ответа ERP. Ресурсы проверяют один раз за заход: повторный ответ
+    /// означает, что проверку повторили, и его нельзя молча принять.
+    pub fn record_resource_check(
+        &self,
+        availability: ResourceAvailability,
+        at: Timestamp,
+    ) -> Result<TicketEvent, TicketError> {
+        self.ensure_open()?;
+        if self.resources.is_some() {
+            return Err(TicketError::ResourcesAlreadyChecked(self.ticket_id));
+        }
+        Ok(TicketEvent::ResourcesChecked(ResourcesCheckedEvent {
+            ticket_id: self.ticket_id,
+            availability,
+            at,
+        }))
+    }
+
+    /// Решение о передаче партнёру: только если ERP сообщила, что своих ресурсов нет.
+    pub fn hand_to_partner(
+        &self,
+        partner_id: PartnerId,
+        at: Timestamp,
+    ) -> Result<TicketEvent, TicketError> {
+        self.ensure_open()?;
+        if let Some(partner) = self.partner {
+            return Err(TicketError::AlreadyWithPartner(partner));
+        }
+        if self.resources != Some(ResourceAvailability::Unavailable) {
+            return Err(TicketError::PartnerNotNeeded(self.ticket_id));
+        }
+        Ok(TicketEvent::HandedToPartner(HandedToPartnerEvent {
+            ticket_id: self.ticket_id,
+            partner_id,
+            at,
+        }))
+    }
+
+    /// Решение об отчёте партнёра. Отчитаться может только партнёр, которому передан тикет.
+    pub fn report_partner_progress(
+        &self,
+        partner_id: PartnerId,
+        comment: &str,
+        at: Timestamp,
+    ) -> Result<TicketEvent, TicketError> {
+        self.ensure_open()?;
+        self.ensure_with_partner(partner_id)?;
+        let comment = comment.trim();
+        if comment.is_empty() {
+            return Err(TicketError::EmptyComment);
+        }
+        Ok(TicketEvent::PartnerProgressReported(
+            PartnerProgressReportedEvent {
+                ticket_id: self.ticket_id,
+                partner_id,
+                comment: comment.to_owned(),
+                at,
+            },
+        ))
+    }
+
+    /// Решение о закрытии тикета партнёром: тот же `TicketClosed`, что и при закрытии агентом,
+    /// но закрыть может только партнёр, которому передан тикет.
+    pub fn resolve_by_partner(
+        &self,
+        partner_id: PartnerId,
+        at: Timestamp,
+    ) -> Result<TicketEvent, TicketError> {
+        self.ensure_can_become(TicketStatus::Closed)?;
+        self.ensure_with_partner(partner_id)?;
+        self.close(CloseReason::Resolved, at)
     }
 
     pub fn ticket_id(&self) -> TicketId {
@@ -186,6 +273,30 @@ impl Ticket {
 
     pub fn last_activity(&self) -> Timestamp {
         self.last_activity
+    }
+
+    pub fn tier(&self) -> CustomerTier {
+        self.tier
+    }
+
+    pub fn sla(&self) -> Sla {
+        self.sla
+    }
+
+    pub fn resources(&self) -> Option<ResourceAvailability> {
+        self.resources
+    }
+
+    pub fn partner(&self) -> Option<PartnerId> {
+        self.partner
+    }
+
+    fn ensure_with_partner(&self, partner_id: PartnerId) -> Result<(), TicketError> {
+        if self.partner == Some(partner_id) {
+            Ok(())
+        } else {
+            Err(TicketError::NotWithPartner(partner_id))
+        }
     }
 
     /// Проверяет по правилам Shared Kernel, что тикет может перейти в статус `next`.
@@ -223,8 +334,12 @@ impl From<&TicketCreatedEvent> for Ticket {
             status: TicketStatus::Open,
             assigned_agent: None,
             tenant: event.tenant_id,
+            tier: event.tier,
+            sla: event.sla,
             last_activity: event.at,
             last_reminder: None,
+            resources: None,
+            partner: None,
         }
     }
 }
@@ -242,8 +357,9 @@ impl Lifecycle for Ticket {
                 category,
                 description,
                 tenant_id,
+                tier,
                 at,
-            } => Ticket::create(*ticket_id, category, description, *tenant_id, *at),
+            } => Ticket::create(*ticket_id, category, description, *tenant_id, *tier, *at),
             _ => Err(TicketError::NotFound),
         }
     }
@@ -255,6 +371,20 @@ impl Lifecycle for Ticket {
             TicketCommand::Close { reason, at } => self.close(*reason, *at),
             TicketCommand::Reopen { at } => self.reopen(*at),
             TicketCommand::SendReminder { kind, at } => self.send_reminder(*kind, *at),
+            TicketCommand::RecordResourceCheck { availability, at } => {
+                self.record_resource_check(*availability, *at)
+            }
+            TicketCommand::HandToPartner { partner_id, at } => {
+                self.hand_to_partner(*partner_id, *at)
+            }
+            TicketCommand::ReportPartnerProgress {
+                partner_id,
+                comment,
+                at,
+            } => self.report_partner_progress(*partner_id, comment, *at),
+            TicketCommand::ResolveByPartner { partner_id, at } => {
+                self.resolve_by_partner(*partner_id, *at)
+            }
         }
     }
 
@@ -284,12 +414,28 @@ impl Lifecycle for Ticket {
             TicketEvent::Reopened(e) => Self {
                 status: TicketStatus::Open,
                 assigned_agent: None,
+                sla: e.sla,
                 last_activity: e.at,
                 last_reminder: None,
+                resources: None,
+                partner: None,
                 ..self
             },
             TicketEvent::ReminderSent(e) => Self {
                 last_reminder: Some(e.kind),
+                ..self
+            },
+            TicketEvent::ResourcesChecked(e) => Self {
+                resources: Some(e.availability),
+                ..self
+            },
+            TicketEvent::HandedToPartner(e) => Self {
+                partner: Some(e.partner_id),
+                ..self
+            },
+            TicketEvent::PartnerProgressReported(e) => Self {
+                last_activity: e.at,
+                last_reminder: None,
                 ..self
             },
         }
@@ -322,6 +468,7 @@ mod tests {
             category: "Technical Issue".to_owned(),
             description: "Problem description".to_owned(),
             tenant_id: TenantId(1),
+            tier: CustomerTier::Bronze,
             at: T0,
         }
     }
@@ -365,6 +512,8 @@ mod tests {
                 category: "Technical Issue".to_owned(),
                 description: "Problem description".to_owned(),
                 tenant_id: TenantId(1),
+                tier: CustomerTier::Bronze,
+                sla: Sla::for_tier(CustomerTier::Bronze, T0),
                 at: T0,
             }))
         );
@@ -389,6 +538,7 @@ mod tests {
             category: "Billing".to_owned(),
             description: "   ".to_owned(),
             tenant_id: TenantId(1),
+            tier: CustomerTier::Bronze,
             at: T0,
         };
         assert_eq!(
@@ -404,6 +554,7 @@ mod tests {
             category: "  ".to_owned(),
             description: "Problem description".to_owned(),
             tenant_id: TenantId(1),
+            tier: CustomerTier::Bronze,
             at: T0,
         };
         assert_eq!(
@@ -537,6 +688,7 @@ mod tests {
             Ok(TicketEvent::Reopened(TicketReopenedEvent {
                 ticket_id: TicketId(1),
                 tenant_id: TenantId(1),
+                sla: Sla::for_tier(CustomerTier::Bronze, at),
                 at,
             }))
         );
@@ -604,6 +756,8 @@ mod tests {
                 tenant_id: TenantId(1),
                 agent_id: None,
                 reason: CloseReason::Inactivity,
+                // 10 дней без активности — дольше, чем 5 дней SLA уровня Bronze.
+                sla_met: false,
                 at,
             }))
         );
@@ -688,6 +842,7 @@ mod tests {
             tenant_id: TenantId(1),
             agent_id: None,
             reason: CloseReason::Resolved,
+            sla_met: true,
             at: T0,
         });
         let _ = None::<Ticket>.apply_event(&event);
@@ -882,6 +1037,286 @@ mod tests {
         assert_eq!(
             event(None),
             "ReminderSent: ticket-1 (closing soon) to admins at t=5s"
+        );
+    }
+
+    // --- SLA, ресурсы и партнёры ---
+
+    const PARTNER: PartnerId = PartnerId(1);
+
+    fn create_for(tier: CustomerTier) -> TicketCommand {
+        TicketCommand::Create {
+            ticket_id: TicketId(1),
+            category: "Hardware".to_owned(),
+            description: "Server is down".to_owned(),
+            tenant_id: TenantId(1),
+            tier,
+            at: T0,
+        }
+    }
+
+    fn close_at(at: Timestamp) -> TicketCommand {
+        TicketCommand::Close {
+            reason: CloseReason::Resolved,
+            at,
+        }
+    }
+
+    fn check(availability: ResourceAvailability) -> TicketCommand {
+        TicketCommand::RecordResourceCheck {
+            availability,
+            at: T0,
+        }
+    }
+
+    fn hand(partner_id: PartnerId) -> TicketCommand {
+        TicketCommand::HandToPartner { partner_id, at: T0 }
+    }
+
+    fn report(partner_id: PartnerId, comment: &str, at: Timestamp) -> TicketCommand {
+        TicketCommand::ReportPartnerProgress {
+            partner_id,
+            comment: comment.to_owned(),
+            at,
+        }
+    }
+
+    fn resolve(partner_id: PartnerId, at: Timestamp) -> TicketCommand {
+        TicketCommand::ResolveByPartner { partner_id, at }
+    }
+
+    fn with_partner() -> Option<Ticket> {
+        let checked = execute(open_ticket(), check(ResourceAvailability::Unavailable));
+        execute(checked, hand(PARTNER))
+    }
+
+    #[test]
+    fn sla_comes_from_customer_tier() {
+        for tier in [
+            CustomerTier::Gold,
+            CustomerTier::Silver,
+            CustomerTier::Bronze,
+        ] {
+            let ticket = execute(None, create_for(tier)).unwrap();
+            assert_eq!(ticket.tier(), tier);
+            assert_eq!(ticket.sla(), Sla::for_tier(tier, T0));
+            assert_eq!(ticket.sla().due_at(), T0.plus_secs(tier.resolution_secs()));
+        }
+    }
+
+    #[test]
+    fn closing_reports_whether_sla_was_met() {
+        let gold = execute(None, create_for(CustomerTier::Gold));
+        let due = T0.plus_secs(CustomerTier::Gold.resolution_secs());
+        let sla_met = |at| match gold.decide(&close_at(at)) {
+            Ok(TicketEvent::Closed(e)) => e.sla_met,
+            other => panic!("ticket is closed, got {other:?}"),
+        };
+        assert!(sla_met(due), "closing exactly at the deadline is in time");
+        assert!(!sla_met(due.plus_secs(1)));
+    }
+
+    #[test]
+    fn reopening_starts_new_sla_for_the_same_tier() {
+        let gold = execute(None, create_for(CustomerTier::Gold));
+        let closed = execute(gold, close_at(T0));
+        let reopened_at = after(7 * DAY_SECS);
+        let expected = Sla::for_tier(CustomerTier::Gold, reopened_at);
+        assert!(matches!(
+            closed.decide(&TicketCommand::Reopen { at: reopened_at }),
+            Ok(TicketEvent::Reopened(TicketReopenedEvent { sla, .. })) if sla == expected
+        ));
+        let reopened = execute(closed, TicketCommand::Reopen { at: reopened_at }).unwrap();
+        assert_eq!(reopened.sla(), expected);
+        assert_eq!(reopened.tier(), CustomerTier::Gold);
+    }
+
+    #[test]
+    fn resource_check_is_recorded_once() {
+        assert_eq!(
+            open_ticket().decide(&check(ResourceAvailability::Available)),
+            Ok(TicketEvent::ResourcesChecked(ResourcesCheckedEvent {
+                ticket_id: TicketId(1),
+                availability: ResourceAvailability::Available,
+                at: T0,
+            }))
+        );
+        let checked = execute(open_ticket(), check(ResourceAvailability::Available));
+        assert_eq!(
+            checked.as_ref().unwrap().resources(),
+            Some(ResourceAvailability::Available)
+        );
+        assert_eq!(
+            checked.decide(&check(ResourceAvailability::Unavailable)),
+            Err(TicketError::ResourcesAlreadyChecked(TicketId(1)))
+        );
+        assert_eq!(
+            closed_ticket().decide(&check(ResourceAvailability::Available)),
+            Err(TicketError::Closed(TicketId(1)))
+        );
+    }
+
+    #[test]
+    fn resource_check_is_not_activity() {
+        let at = after(DAY_SECS);
+        let checked = execute(
+            open_ticket(),
+            TicketCommand::RecordResourceCheck {
+                availability: ResourceAvailability::Available,
+                at,
+            },
+        );
+        assert_eq!(checked.unwrap().last_activity(), T0);
+    }
+
+    #[test]
+    fn partner_is_needed_only_when_resources_are_unavailable() {
+        assert_eq!(
+            open_ticket().decide(&hand(PARTNER)),
+            Err(TicketError::PartnerNotNeeded(TicketId(1)))
+        );
+        let available = execute(open_ticket(), check(ResourceAvailability::Available));
+        assert_eq!(
+            available.decide(&hand(PARTNER)),
+            Err(TicketError::PartnerNotNeeded(TicketId(1)))
+        );
+        let unavailable = execute(open_ticket(), check(ResourceAvailability::Unavailable));
+        assert_eq!(
+            unavailable.decide(&hand(PARTNER)),
+            Ok(TicketEvent::HandedToPartner(HandedToPartnerEvent {
+                ticket_id: TicketId(1),
+                partner_id: PARTNER,
+                at: T0,
+            }))
+        );
+    }
+
+    #[test]
+    fn ticket_is_handed_to_one_partner_only() {
+        let ticket = with_partner();
+        assert_eq!(ticket.as_ref().unwrap().partner(), Some(PARTNER));
+        assert_eq!(
+            ticket.decide(&hand(PartnerId(2))),
+            Err(TicketError::AlreadyWithPartner(PARTNER))
+        );
+    }
+
+    #[test]
+    fn partner_progress_is_activity_and_restarts_reminders() {
+        let at = after(STALE_REMINDER_AFTER_SECS);
+        let reminded = execute(with_partner(), remind(ReminderKind::Stale, at));
+        assert_eq!(
+            reminded.decide(&report(PARTNER, "  Replacement part ordered  ", at)),
+            Ok(TicketEvent::PartnerProgressReported(
+                PartnerProgressReportedEvent {
+                    ticket_id: TicketId(1),
+                    partner_id: PARTNER,
+                    comment: "Replacement part ordered".to_owned(),
+                    at,
+                }
+            ))
+        );
+        let reported = execute(reminded, report(PARTNER, "Replacement part ordered", at));
+        assert_eq!(reported.as_ref().unwrap().last_activity(), at);
+        let due_again = Timestamp(at.0 + STALE_REMINDER_AFTER_SECS);
+        assert!(
+            reported
+                .decide(&remind(ReminderKind::Stale, due_again))
+                .is_ok()
+        );
+        let close = TicketCommand::Close {
+            reason: CloseReason::Inactivity,
+            at: after(INACTIVITY_TIMEOUT_SECS),
+        };
+        assert!(matches!(
+            reported.decide(&close),
+            Err(TicketError::StillActive { .. })
+        ));
+    }
+
+    #[test]
+    fn only_the_assigned_partner_reports_and_with_some_text() {
+        assert_eq!(
+            open_ticket().decide(&report(PARTNER, "done", T0)),
+            Err(TicketError::NotWithPartner(PARTNER))
+        );
+        assert_eq!(
+            with_partner().decide(&report(PartnerId(2), "done", T0)),
+            Err(TicketError::NotWithPartner(PartnerId(2)))
+        );
+        assert_eq!(
+            with_partner().decide(&report(PARTNER, "   ", T0)),
+            Err(TicketError::EmptyComment)
+        );
+    }
+
+    #[test]
+    fn partner_resolution_closes_ticket_as_resolved() {
+        let at = after(DAY_SECS);
+        let Ok(TicketEvent::Closed(event)) = with_partner().decide(&resolve(PARTNER, at)) else {
+            panic!("partner resolves its ticket");
+        };
+        assert_eq!(event.reason, CloseReason::Resolved);
+        assert_eq!(event.at, at);
+        assert!(event.sla_met);
+        let closed = execute(with_partner(), resolve(PARTNER, at)).unwrap();
+        assert_eq!(closed.status(), TicketStatus::Closed);
+    }
+
+    #[test]
+    fn partner_cannot_resolve_foreign_or_closed_ticket() {
+        assert_eq!(
+            open_ticket().decide(&resolve(PARTNER, T0)),
+            Err(TicketError::NotWithPartner(PARTNER))
+        );
+        assert_eq!(
+            with_partner().decide(&resolve(PartnerId(2), T0)),
+            Err(TicketError::NotWithPartner(PartnerId(2)))
+        );
+        let closed = execute(with_partner(), resolve(PARTNER, T0));
+        assert_eq!(
+            closed.decide(&resolve(PARTNER, T0)),
+            Err(TicketError::Closed(TicketId(1)))
+        );
+        assert_eq!(
+            closed.decide(&report(PARTNER, "late note", T0)),
+            Err(TicketError::Closed(TicketId(1)))
+        );
+    }
+
+    #[test]
+    fn reopened_ticket_forgets_resources_and_partner() {
+        let closed = execute(with_partner(), resolve(PARTNER, T0));
+        let reopened = execute(closed, TicketCommand::Reopen { at: T0 });
+        let ticket = reopened.as_ref().unwrap();
+        assert_eq!(ticket.resources(), None);
+        assert_eq!(ticket.partner(), None);
+        assert!(
+            reopened
+                .decide(&check(ResourceAvailability::Available))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn integration_events_are_readable_in_logs() {
+        let checked = TicketEvent::ResourcesChecked(ResourcesCheckedEvent {
+            ticket_id: TicketId(1),
+            availability: ResourceAvailability::Unavailable,
+            at: Timestamp(5),
+        });
+        assert_eq!(
+            checked.to_string(),
+            "ResourcesChecked: ticket-1 resources unavailable at t=5s"
+        );
+        let handed = TicketEvent::HandedToPartner(HandedToPartnerEvent {
+            ticket_id: TicketId(1),
+            partner_id: PARTNER,
+            at: Timestamp(5),
+        });
+        assert_eq!(
+            handed.to_string(),
+            "HandedToPartner: ticket-1 -> partner-1 at t=5s"
         );
     }
 }

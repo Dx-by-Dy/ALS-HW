@@ -23,7 +23,11 @@ impl OpenTickets {
                     *count = count.saturating_sub(1);
                 }
             }
-            TicketEvent::AgentAssigned(_) | TicketEvent::ReminderSent(_) => {}
+            TicketEvent::AgentAssigned(_)
+            | TicketEvent::ReminderSent(_)
+            | TicketEvent::ResourcesChecked(_)
+            | TicketEvent::HandedToPartner(_)
+            | TicketEvent::PartnerProgressReported(_) => {}
         }
     }
 
@@ -47,6 +51,7 @@ mod tests {
         time::Timestamp,
         user::UserId,
     };
+    use kernel::sla::{CustomerTier, Sla};
 
     fn created(ticket: usize, tenant: usize) -> TicketEvent {
         TicketEvent::Created(TicketCreatedEvent {
@@ -54,6 +59,8 @@ mod tests {
             category: "c".to_owned(),
             description: "d".to_owned(),
             tenant_id: TenantId(tenant),
+            tier: CustomerTier::Bronze,
+            sla: Sla::for_tier(CustomerTier::Bronze, Timestamp(0)),
             at: Timestamp(0),
         })
     }
@@ -64,6 +71,7 @@ mod tests {
             tenant_id: TenantId(tenant),
             agent_id: None,
             reason: CloseReason::Resolved,
+            sla_met: true,
             at: Timestamp(0),
         })
     }
@@ -88,6 +96,7 @@ mod tests {
         view.project(&TicketEvent::Reopened(TicketReopenedEvent {
             ticket_id: TicketId(1),
             tenant_id: TenantId(1),
+            sla: Sla::for_tier(CustomerTier::Bronze, Timestamp(0)),
             at: Timestamp(0),
         }));
         assert_eq!(view.count_for_tenant(TenantId(1)), 1);

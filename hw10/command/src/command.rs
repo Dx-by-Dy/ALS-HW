@@ -1,7 +1,9 @@
 use ticketing::application::{
     commands::{
         ApplyDiscountCommand, AssignAgentCommand, CloseTicketCommand, CreateTicketCommand,
-        RegisterTenantCommand, RegisterUserCommand, ReopenTicketCommand, SendReminderCommand,
+        HandToPartnerCommand, RecordResourceCheckCommand, RegisterTenantCommand,
+        RegisterUserCommand, ReopenTicketCommand, ReportPartnerProgressCommand,
+        ResolveByPartnerCommand, SendReminderCommand,
     },
     ticket_lifecycle::LifecycleCommand,
 };
@@ -17,6 +19,10 @@ pub enum Command {
     ReopenTicket(ReopenTicketCommand),
     SendReminder(SendReminderCommand),
     ApplyDiscount(ApplyDiscountCommand),
+    RecordResourceCheck(RecordResourceCheckCommand),
+    HandToPartner(HandToPartnerCommand),
+    ReportPartnerProgress(ReportPartnerProgressCommand),
+    ResolveByPartner(ResolveByPartnerCommand),
 }
 
 impl From<LifecycleCommand> for Command {
@@ -49,4 +55,8 @@ impl_from_command!(
     ReopenTicket(ReopenTicketCommand),
     SendReminder(SendReminderCommand),
     ApplyDiscount(ApplyDiscountCommand),
+    RecordResourceCheck(RecordResourceCheckCommand),
+    HandToPartner(HandToPartnerCommand),
+    ReportPartnerProgress(ReportPartnerProgressCommand),
+    ResolveByPartner(ResolveByPartnerCommand),
 );

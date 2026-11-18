@@ -73,6 +73,14 @@ impl<C: Clock> CommandActor<C> {
             Command::ReopenTicket(c) => service.handle_reopen_ticket(c).await.map(drop),
             Command::SendReminder(c) => service.handle_send_reminder(c).await.map(drop),
             Command::ApplyDiscount(c) => service.handle_apply_discount(c).await.map(drop),
+            Command::RecordResourceCheck(c) => {
+                service.handle_record_resource_check(c).await.map(drop)
+            }
+            Command::HandToPartner(c) => service.handle_hand_to_partner(c).await.map(drop),
+            Command::ReportPartnerProgress(c) => {
+                service.handle_report_partner_progress(c).await.map(drop)
+            }
+            Command::ResolveByPartner(c) => service.handle_resolve_by_partner(c).await.map(drop),
         }
     }
 
@@ -124,6 +132,7 @@ mod tests {
             RegisterUserCommand, SendReminderCommand,
         },
     };
+    use ticketing::domain::sla::CustomerTier;
     use ticketing::domain::{
         tenant::TenantId,
         ticket::{
@@ -138,7 +147,7 @@ mod tests {
     }
 
     fn ticket(tenant_id: TenantId) -> CreateTicketCommand {
-        CreateTicketCommand::new("Billing", "Wrong invoice", tenant_id)
+        CreateTicketCommand::new("Billing", "Wrong invoice", tenant_id, CustomerTier::Bronze)
     }
 
     /// Актор с тенантом `TenantId(1)` (версия 1) и агентом `UserId(1)` (версия 2).

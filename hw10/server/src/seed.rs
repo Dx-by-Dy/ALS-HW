@@ -9,6 +9,7 @@ use ticketing::application::commands::{
 };
 use ticketing::domain::{
     DomainEvent,
+    sla::CustomerTier,
     tenant::TenantId,
     ticket::{CloseReason, TicketId},
     user::{Role, UserId},
@@ -45,12 +46,17 @@ pub async fn seed(bus: &CommandActorHandle) -> Result<Version, CommandError> {
     ];
     let mut ids = Vec::new();
     for (category, description) in acme_tickets {
-        let command = CreateTicketCommand::new(category, description, acme);
+        let command = CreateTicketCommand::new(category, description, acme, CustomerTier::Gold);
         ids.push(ticket_id(bus.send(command).await?));
     }
     for (category, description) in [("Billing", "Need a VAT invoice"), ("Access", "Reset 2FA")] {
-        bus.send(CreateTicketCommand::new(category, description, globex))
-            .await?;
+        bus.send(CreateTicketCommand::new(
+            category,
+            description,
+            globex,
+            CustomerTier::Silver,
+        ))
+        .await?;
     }
 
     bus.send(AssignAgentCommand {

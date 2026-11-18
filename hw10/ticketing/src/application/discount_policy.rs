@@ -20,7 +20,13 @@ impl Policy<DomainEvent> for DiscountPolicy {
             DomainEvent::Ticket(TicketEvent::Created(e)) => e.tenant_id,
             DomainEvent::Ticket(TicketEvent::Closed(e)) => e.tenant_id,
             DomainEvent::Ticket(TicketEvent::Reopened(e)) => e.tenant_id,
-            DomainEvent::Ticket(TicketEvent::AgentAssigned(_) | TicketEvent::ReminderSent(_))
+            DomainEvent::Ticket(
+                TicketEvent::AgentAssigned(_)
+                | TicketEvent::ReminderSent(_)
+                | TicketEvent::ResourcesChecked(_)
+                | TicketEvent::HandedToPartner(_)
+                | TicketEvent::PartnerProgressReported(_),
+            )
             | DomainEvent::Tenant(_)
             | DomainEvent::User(_) => return Vec::new(),
         };
@@ -40,6 +46,7 @@ mod tests {
         time::Timestamp,
         user::UserId,
     };
+    use kernel::sla::{CustomerTier, Sla};
 
     const ACME: TenantId = TenantId(1);
     const TICKET: TicketId = TicketId(1);
@@ -56,6 +63,8 @@ mod tests {
             category: "Billing".to_owned(),
             description: "Wrong invoice".to_owned(),
             tenant_id: ACME,
+            tier: CustomerTier::Bronze,
+            sla: Sla::for_tier(CustomerTier::Bronze, Timestamp(0)),
             at: Timestamp(0),
         });
         let closed = TicketEvent::Closed(TicketClosedEvent {
@@ -63,11 +72,13 @@ mod tests {
             tenant_id: ACME,
             agent_id: None,
             reason: CloseReason::Inactivity,
+            sla_met: true,
             at: Timestamp(0),
         });
         let reopened = TicketEvent::Reopened(TicketReopenedEvent {
             ticket_id: TICKET,
             tenant_id: ACME,
+            sla: Sla::for_tier(CustomerTier::Bronze, Timestamp(0)),
             at: Timestamp(0),
         });
         assert_eq!(react(created), recalculate);

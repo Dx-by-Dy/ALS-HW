@@ -34,6 +34,7 @@ use ticketing::application::{
 };
 use ticketing::domain::{
     DomainEvent,
+    sla::CustomerTier,
     tenant::{DiscountRate, TenantError, TenantId},
     ticket::{
         CloseReason, INACTIVITY_TIMEOUT_SECS, ReminderKind, STALE_REMINDER_AFTER_SECS, TicketId,
@@ -66,7 +67,7 @@ async fn acme_with_alice(bus: &CommandActorHandle) -> Version {
 async fn create_ticket(bus: &CommandActorHandle) -> Version {
     send(
         bus,
-        CreateTicketCommand::new("Billing", "Wrong invoice", ACME),
+        CreateTicketCommand::new("Billing", "Wrong invoice", ACME, CustomerTier::Bronze),
     )
     .await
 }

@@ -18,6 +18,7 @@ use ticketing::application::commands::{
 };
 use ticketing::domain::{
     DomainEvent,
+    sla::CustomerTier,
     tenant::TenantId,
     ticket::{CloseReason, TicketId},
     user::UserId,
@@ -44,10 +45,12 @@ pub async fn create_ticket(
     State(state): Shared,
     Json(request): Json<CreateTicketRequest>,
 ) -> ApiResult<CommandAcceptedDto> {
+    // Уровень клиента пока не спрашиваем у CRM: все клиенты считаются Bronze.
     let command = CreateTicketCommand::new(
         request.category,
         request.description,
         TenantId(request.tenant_id),
+        CustomerTier::Bronze,
     );
     send(&state, command).await
 }

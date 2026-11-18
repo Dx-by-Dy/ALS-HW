@@ -4,10 +4,12 @@
 //! ни данных других агрегатов: всё это подставляет `TicketService`.
 
 use crate::domain::{
+    partner::PartnerId,
     tenant::TenantId,
-    ticket::{CloseReason, ReminderKind, TicketId},
+    ticket::{CloseReason, ReminderKind, ResourceAvailability, TicketId},
     user::{Role, UserId},
 };
+use kernel::sla::CustomerTier;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisterTenantCommand {
@@ -42,6 +44,9 @@ pub struct CreateTicketCommand {
     pub category: String,
     pub description: String,
     pub tenant_id: TenantId,
+    /// Уровень клиента по данным CRM: его узнают до того, как команда попадёт в сервис,
+    /// чтобы командная сторона не ждала внешних систем.
+    pub tier: CustomerTier,
 }
 
 impl CreateTicketCommand {
@@ -49,11 +54,13 @@ impl CreateTicketCommand {
         category: impl Into<String>,
         description: impl Into<String>,
         tenant_id: TenantId,
+        tier: CustomerTier,
     ) -> Self {
         Self {
             category: category.into(),
             description: description.into(),
             tenant_id,
+            tier,
         }
     }
 }
@@ -79,6 +86,31 @@ pub struct ReopenTicketCommand {
 pub struct SendReminderCommand {
     pub ticket_id: TicketId,
     pub kind: ReminderKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordResourceCheckCommand {
+    pub ticket_id: TicketId,
+    pub availability: ResourceAvailability,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandToPartnerCommand {
+    pub ticket_id: TicketId,
+    pub partner_id: PartnerId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportPartnerProgressCommand {
+    pub ticket_id: TicketId,
+    pub partner_id: PartnerId,
+    pub comment: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolveByPartnerCommand {
+    pub ticket_id: TicketId,
+    pub partner_id: PartnerId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

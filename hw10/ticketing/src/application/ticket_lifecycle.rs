@@ -24,7 +24,8 @@ pub enum LifecycleCommand {
 /// Оркестратор жизненного цикла тикета: от создания до закрытия.
 ///
 /// Запускается на `TicketCreated` и `TicketReopened`, завершается на `TicketClosed`, а вместе
-/// с ним удаляются и дедлайны. Назначение агента — активность, поэтому переставляет все сроки.
+/// с ним удаляются и дедлайны. Назначение агента и отчёт партнёра — активность, поэтому
+/// переставляют все сроки.
 ///
 /// Сроки считаются из времени в событиях, а не из текущего, поэтому состояние саги однозначно
 /// восстанавливается из журнала. Команды может отклонить агрегат: дедлайн мог устареть,
@@ -79,10 +80,17 @@ impl Saga for TicketLifecycleSaga {
     fn on_event(&mut self, event: &DomainEvent) -> SagaEffects<Self> {
         match event {
             DomainEvent::Ticket(TicketEvent::AgentAssigned(e)) => deadlines_from(e.at),
+            DomainEvent::Ticket(TicketEvent::PartnerProgressReported(e)) => deadlines_from(e.at),
             DomainEvent::Ticket(TicketEvent::Reopened(e)) => deadlines_from(e.at),
             DomainEvent::Ticket(TicketEvent::Closed(_)) => Effects::none().finish(),
-            // Напоминание — не активность, и сроков оно не меняет.
-            DomainEvent::Ticket(TicketEvent::Created(_) | TicketEvent::ReminderSent(_))
+            // Напоминание, проверка ресурсов и передача партнёру — не активность,
+            // и сроков они не меняют.
+            DomainEvent::Ticket(
+                TicketEvent::Created(_)
+                | TicketEvent::ReminderSent(_)
+                | TicketEvent::ResourcesChecked(_)
+                | TicketEvent::HandedToPartner(_),
+            )
             | DomainEvent::Tenant(_)
             | DomainEvent::User(_) => Effects::none(),
         }
@@ -118,13 +126,16 @@ mod tests {
         ticket_service::TicketService,
     };
     use crate::domain::{
+        partner::PartnerId,
         tenant::{TenantEvent, TenantId, TenantRegisteredEvent},
         ticket::{
-            AgentAssignedEvent, ReminderSentEvent, TicketClosedEvent, TicketCreatedEvent,
-            TicketError, TicketReopenedEvent, TicketStatus,
+            AgentAssignedEvent, HandedToPartnerEvent, PartnerProgressReportedEvent,
+            ReminderSentEvent, ResourceAvailability, ResourcesCheckedEvent, TicketClosedEvent,
+            TicketCreatedEvent, TicketError, TicketReopenedEvent, TicketStatus,
         },
         user::{Role, UserId},
     };
+    use kernel::sla::{CustomerTier, Sla};
 
     const DAY: u64 = 24 * 60 * 60;
     const T1: TicketId = TicketId(1);
@@ -144,6 +155,8 @@ mod tests {
             category: "Billing".to_owned(),
             description: "Wrong invoice".to_owned(),
             tenant_id: TenantId(1),
+            tier: CustomerTier::Bronze,
+            sla: Sla::for_tier(CustomerTier::Bronze, at),
             at,
         })
         .into()
@@ -165,6 +178,7 @@ mod tests {
             tenant_id: TenantId(1),
             agent_id: None,
             reason: CloseReason::Resolved,
+            sla_met: true,
             at,
         })
         .into()
@@ -174,6 +188,7 @@ mod tests {
         TicketEvent::Reopened(TicketReopenedEvent {
             ticket_id,
             tenant_id: TenantId(1),
+            sla: Sla::for_tier(CustomerTier::Bronze, at),
             at,
         })
         .into()
@@ -297,6 +312,50 @@ mod tests {
         assert_eq!(
             fire_due(&mut manager, &day(7)),
             [remind(T1, ReminderKind::Stale)]
+        );
+    }
+
+    #[test]
+    fn partner_progress_moves_all_deadlines() {
+        let progress = DomainEvent::Ticket(TicketEvent::PartnerProgressReported(
+            PartnerProgressReportedEvent {
+                ticket_id: T1,
+                partner_id: PartnerId(1),
+                comment: "On site tomorrow".to_owned(),
+                at: day(2),
+            },
+        ));
+        let manager = manager_with([created(T1, day(0)), progress]);
+        assert_eq!(
+            manager.deadlines_of(&T1),
+            [
+                (STALE, day(5)),
+                (CLOSING_SOON, day(11)),
+                (TicketDeadline::AutoClose, day(12)),
+            ]
+        );
+    }
+
+    #[test]
+    fn resource_check_and_handover_do_not_move_deadlines() {
+        let checked = DomainEvent::Ticket(TicketEvent::ResourcesChecked(ResourcesCheckedEvent {
+            ticket_id: T1,
+            availability: ResourceAvailability::Unavailable,
+            at: day(1),
+        }));
+        let handed = DomainEvent::Ticket(TicketEvent::HandedToPartner(HandedToPartnerEvent {
+            ticket_id: T1,
+            partner_id: PartnerId(1),
+            at: day(1),
+        }));
+        let manager = manager_with([created(T1, day(0)), checked, handed]);
+        assert_eq!(
+            manager.deadlines_of(&T1),
+            [
+                (STALE, day(3)),
+                (CLOSING_SOON, day(9)),
+                (TicketDeadline::AutoClose, day(10)),
+            ]
         );
     }
 
@@ -457,7 +516,12 @@ mod tests {
         let mut process = Process::new().await;
         process
             .service
-            .handle_create_ticket(CreateTicketCommand::new("Billing", "Invoice", TenantId(1)))
+            .handle_create_ticket(CreateTicketCommand::new(
+                "Billing",
+                "Invoice",
+                TenantId(1),
+                CustomerTier::Bronze,
+            ))
             .await
             .unwrap();
 
@@ -508,7 +572,12 @@ mod tests {
         let mut process = Process::new().await;
         process
             .service
-            .handle_create_ticket(CreateTicketCommand::new("Billing", "Invoice", TenantId(1)))
+            .handle_create_ticket(CreateTicketCommand::new(
+                "Billing",
+                "Invoice",
+                TenantId(1),
+                CustomerTier::Bronze,
+            ))
             .await
             .unwrap();
 
@@ -528,7 +597,12 @@ mod tests {
         let mut process = Process::new().await;
         process
             .service
-            .handle_create_ticket(CreateTicketCommand::new("Billing", "Invoice", TenantId(1)))
+            .handle_create_ticket(CreateTicketCommand::new(
+                "Billing",
+                "Invoice",
+                TenantId(1),
+                CustomerTier::Bronze,
+            ))
             .await
             .unwrap();
         process
@@ -559,7 +633,12 @@ mod tests {
         let mut process = Process::new().await;
         process
             .service
-            .handle_create_ticket(CreateTicketCommand::new("Billing", "Invoice", TenantId(1)))
+            .handle_create_ticket(CreateTicketCommand::new(
+                "Billing",
+                "Invoice",
+                TenantId(1),
+                CustomerTier::Bronze,
+            ))
             .await
             .unwrap();
         process.drain_events();

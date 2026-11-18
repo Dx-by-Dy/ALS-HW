@@ -2,7 +2,10 @@ use std::error::Error;
 use std::fmt;
 
 use super::{ReminderKind, TicketId};
-use crate::domain::user::{Role, UserId};
+use crate::domain::{
+    partner::PartnerId,
+    user::{Role, UserId},
+};
 
 /// Нарушения инвариантов агрегата `Ticket`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +32,16 @@ pub enum TicketError {
     ReminderNotDue { kind: ReminderKind, idle_secs: u64 },
     /// С последней активности уже отправлено это или более позднее напоминание.
     ReminderAlreadySent(ReminderKind),
+    /// Ресурсы уже проверены с момента создания или повторного открытия.
+    ResourcesAlreadyChecked(TicketId),
+    /// Партнёр нужен, только если проверка показала, что своих ресурсов нет.
+    PartnerNotNeeded(TicketId),
+    /// Тикет уже передан партнёру.
+    AlreadyWithPartner(PartnerId),
+    /// Этот партнёр тикетом не занимается.
+    NotWithPartner(PartnerId),
+    /// Отчёт партнёра не может быть пустым.
+    EmptyComment,
 }
 
 impl fmt::Display for TicketError {
@@ -65,6 +78,18 @@ impl fmt::Display for TicketError {
                     "the {kind} reminder is no longer needed: it or a later one was sent"
                 )
             }
+            Self::ResourcesAlreadyChecked(id) => {
+                write!(f, "resources for {id} are already checked")
+            }
+            Self::PartnerNotNeeded(id) => write!(
+                f,
+                "{id} needs no partner: resources were not reported unavailable"
+            ),
+            Self::AlreadyWithPartner(partner) => {
+                write!(f, "ticket is already handed to {partner}")
+            }
+            Self::NotWithPartner(partner) => write!(f, "ticket is not handed to {partner}"),
+            Self::EmptyComment => write!(f, "progress comment must not be empty"),
         }
     }
 }
