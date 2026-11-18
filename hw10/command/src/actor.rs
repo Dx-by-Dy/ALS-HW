@@ -1,0 +1,265 @@
+use framework::cqrs::envelope::{Committed, Envelope, Version};
+use ticketing::application::{clock::Clock, error::ServiceError, ticket_service::TicketService};
+use ticketing::domain::DomainEvent;
+use tokio::sync::mpsc;
+
+use crate::command::Command;
+use crate::handle::{CommandActorHandle, EventSubscription, Message};
+
+/// Сколько команд может ждать в очереди, прежде чем отправители начнут ждать места.
+const INBOX_CAPACITY: usize = 64;
+
+/// Запускает актор в задаче tokio и возвращает ручку к нему.
+/// Актор останавливается, когда пропадает последний клон [`CommandActorHandle`].
+pub fn spawn<C>(service: TicketService<C>) -> CommandActorHandle
+where
+    C: Clock + Send + Sync + 'static,
+{
+    let (sender, inbox) = mpsc::channel(INBOX_CAPACITY);
+    let actor = CommandActor {
+        service,
+        inbox,
+        journal: Vec::new(),
+        subscribers: Vec::new(),
+    };
+    tokio::spawn(actor.run());
+    CommandActorHandle::new(sender)
+}
+
+/// Единственный писатель: команды выполняются по одной, поэтому между проверкой
+/// и записью ничего не вклинивается, а у событий однозначный общий порядок.
+struct CommandActor<C> {
+    service: TicketService<C>,
+    inbox: mpsc::Receiver<Message>,
+    /// Общий журнал всех стримов в порядке записи: на него можно подписаться с любой версии.
+    journal: Vec<Envelope<DomainEvent>>,
+    subscribers: Vec<mpsc::UnboundedSender<Envelope<DomainEvent>>>,
+}
+
+impl<C: Clock> CommandActor<C> {
+    async fn run(mut self) {
+        while let Some(message) = self.inbox.recv().await {
+            match message {
+                Message::Execute { command, reply } => {
+                    let result = self.execute(command).await;
+                    // Отправитель мог не дождаться ответа — команда всё равно выполнена.
+                    let _ = reply.send(result);
+                }
+                Message::Subscribe { after, reply } => {
+                    let _ = reply.send(self.subscribe(after));
+                }
+            }
+        }
+    }
+
+    async fn execute(&mut self, command: Command) -> Result<Committed<DomainEvent>, ServiceError> {
+        let result = self.dispatch(command).await;
+        // Публикуем и при ошибке: команда могла успеть записать часть событий.
+        let events = self.publish_outbox();
+        result.map(|()| Committed {
+            version: self.version(),
+            events,
+        })
+    }
+
+    async fn dispatch(&mut self, command: Command) -> Result<(), ServiceError> {
+        let service = &mut self.service;
+        match command {
+            Command::RegisterTenant(c) => service.register_tenant(c).await.map(drop),
+            Command::RegisterUser(c) => service.register_user(c).await.map(drop),
+            Command::CreateTicket(c) => service.handle_create_ticket(c).await.map(drop),
+            Command::AssignAgent(c) => service.handle_assign_agent(c).await.map(drop),
+            Command::CloseTicket(c) => service.handle_close_ticket(c).await.map(drop),
+            Command::ReopenTicket(c) => service.handle_reopen_ticket(c).await.map(drop),
+            Command::SendReminder(c) => service.handle_send_reminder(c).await.map(drop),
+            Command::ApplyDiscount(c) => service.handle_apply_discount(c).await.map(drop),
+        }
+    }
+
+    /// Присваивает версии новым событиям, дописывает их в журнал и рассылает подписчикам.
+    fn publish_outbox(&mut self) -> Vec<Envelope<DomainEvent>> {
+        let mut published = Vec::new();
+        for event in self.service.take_outbox() {
+            let envelope = Envelope {
+                version: self.version().next(),
+                event,
+            };
+            // Подписчик, который закрыл свой конец канала, больше не нужен.
+            self.subscribers
+                .retain(|subscriber| subscriber.send(envelope.clone()).is_ok());
+            self.journal.push(envelope.clone());
+            published.push(envelope);
+        }
+        published
+    }
+
+    fn subscribe(&mut self, after: Version) -> EventSubscription {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let history = usize::try_from(after.0).unwrap_or(usize::MAX);
+        for envelope in self.journal.iter().skip(history) {
+            // Получатель ещё у нас в руках, отправка не может провалиться.
+            let _ = sender.send(envelope.clone());
+        }
+        self.subscribers.push(sender);
+        EventSubscription(receiver)
+    }
+
+    fn version(&self) -> Version {
+        Version(self.journal.len() as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CommandError;
+    use framework::cqrs::{
+        command_bus::CommandBus,
+        event_source::{EventSource, Subscription},
+    };
+    use ticketing::application::{
+        clock::ManualClock,
+        commands::{
+            AssignAgentCommand, CloseTicketCommand, CreateTicketCommand, RegisterTenantCommand,
+            RegisterUserCommand, SendReminderCommand,
+        },
+    };
+    use ticketing::domain::{
+        tenant::TenantId,
+        ticket::{
+            CloseReason, ReminderKind, STALE_REMINDER_AFTER_SECS, TicketError, TicketEvent,
+            TicketId,
+        },
+        user::{Role, UserId},
+    };
+
+    fn versions(committed: &Committed<DomainEvent>) -> Vec<u64> {
+        committed.events.iter().map(|e| e.version.0).collect()
+    }
+
+    fn ticket(tenant_id: TenantId) -> CreateTicketCommand {
+        CreateTicketCommand::new("Billing", "Wrong invoice", tenant_id)
+    }
+
+    /// Актор с тенантом `TenantId(1)` (версия 1) и агентом `UserId(1)` (версия 2).
+    async fn bus_with_tenant() -> (CommandActorHandle, ManualClock) {
+        let clock = ManualClock::default();
+        let bus = spawn(TicketService::new(clock.clone()));
+        bus.send(RegisterTenantCommand::new("Acme")).await.unwrap();
+        bus.send(RegisterUserCommand::new("Alice", Role::Agent))
+            .await
+            .unwrap();
+        (bus, clock)
+    }
+
+    #[tokio::test]
+    async fn every_event_gets_next_global_version() {
+        let bus = spawn(TicketService::new(ManualClock::default()));
+        let tenant = bus.send(RegisterTenantCommand::new("Acme")).await.unwrap();
+        assert_eq!(tenant.version, Version(1));
+        assert!(matches!(
+            tenant.events[0].event,
+            DomainEvent::Tenant(ref e) if e.tenant_id() == TenantId(1)
+        ));
+
+        let ticket = bus.send(ticket(TenantId(1))).await.unwrap();
+        assert_eq!(ticket.version, Version(2));
+        assert_eq!(versions(&ticket), [2]);
+    }
+
+    #[tokio::test]
+    async fn rejected_command_takes_no_version() {
+        let (bus, _) = bus_with_tenant().await;
+        assert_eq!(
+            bus.send(ticket(TenantId(99))).await,
+            Err(CommandError::Rejected(ServiceError::UnknownTenant(
+                TenantId(99)
+            )))
+        );
+        let committed = bus.send(ticket(TenantId(1))).await.unwrap();
+        assert_eq!(committed.version, Version(3));
+    }
+
+    #[tokio::test]
+    async fn subscriber_gets_history_after_version_then_live_events() {
+        let (bus, _) = bus_with_tenant().await;
+        let mut events = bus.subscribe(Version(1)).await.unwrap();
+        assert_eq!(events.next().await.unwrap().version, Version(2));
+        assert_eq!(events.try_next(), None);
+
+        bus.send(ticket(TenantId(1))).await.unwrap();
+        bus.send(CloseTicketCommand {
+            ticket_id: TicketId(1),
+            reason: CloseReason::Resolved,
+        })
+        .await
+        .unwrap();
+        let live: Vec<_> = [events.next().await, events.next().await]
+            .into_iter()
+            .map(|e| e.unwrap().version)
+            .collect();
+        assert_eq!(live, [Version(3), Version(4)]);
+    }
+
+    #[tokio::test]
+    async fn subscriber_after_last_version_gets_only_new_events() {
+        let (bus, _) = bus_with_tenant().await;
+        let mut events = bus.subscribe(Version(100)).await.unwrap();
+        assert_eq!(events.try_next(), None);
+        bus.send(ticket(TenantId(1))).await.unwrap();
+        assert_eq!(events.next().await.unwrap().version, Version(3));
+    }
+
+    #[tokio::test]
+    async fn rejected_command_reaches_no_subscriber() {
+        let (bus, _) = bus_with_tenant().await;
+        let mut events = bus.subscribe(Version(2)).await.unwrap();
+        let assign_missing_ticket = AssignAgentCommand {
+            ticket_id: TicketId(1),
+            agent_id: UserId(1),
+        };
+        assert!(bus.send(assign_missing_ticket).await.is_err());
+        assert_eq!(events.try_next(), None);
+    }
+
+    #[tokio::test]
+    async fn concurrent_senders_are_serialized() {
+        let (bus, _) = bus_with_tenant().await;
+        let senders: Vec<_> = (0..10)
+            .map(|_| {
+                let bus = bus.clone();
+                tokio::spawn(async move { bus.send(ticket(TenantId(1))).await.unwrap() })
+            })
+            .collect();
+        let mut versions = Vec::new();
+        for sender in senders {
+            versions.push(sender.await.unwrap().version.0);
+        }
+        versions.sort();
+        assert_eq!(versions, (3..=12).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn reminder_is_published_and_early_one_takes_no_version() {
+        let (bus, clock) = bus_with_tenant().await;
+        bus.send(ticket(TenantId(1))).await.unwrap();
+        let reminder = SendReminderCommand {
+            ticket_id: TicketId(1),
+            kind: ReminderKind::Stale,
+        };
+        assert!(matches!(
+            bus.send(reminder).await,
+            Err(CommandError::Rejected(ServiceError::Ticket(
+                TicketError::ReminderNotDue { .. }
+            )))
+        ));
+
+        clock.advance(STALE_REMINDER_AFTER_SECS);
+        let committed = bus.send(reminder).await.unwrap();
+        assert_eq!(versions(&committed), [4]);
+        assert!(matches!(
+            committed.events[0].event,
+            DomainEvent::Ticket(TicketEvent::ReminderSent(_))
+        ));
+    }
+}
