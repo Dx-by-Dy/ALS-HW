@@ -1,0 +1,11 @@
+[package]
+name = "integration"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+external = { path = "../external" }
+ticketing = { path = "../ticketing" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

@@ -4,5 +4,6 @@ pub mod discount_policy;
 pub mod error;
 pub mod notifications;
 pub mod open_tickets;
+pub mod ports;
 pub mod ticket_lifecycle;
 pub mod ticket_service;
