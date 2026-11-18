@@ -1,4 +1,4 @@
-# Архитектура HW9
+# Архитектура HW10
 
 Система тикетов, разделённая по CQRS: команды меняют состояние через агрегаты на event
 sourcing, запросы читают отдельную read-модель, которую строит поток событий. Жизненным
@@ -6,8 +6,12 @@ sourcing, запросы читают отдельную read-модель, ко
 участники хореографии: скидки, уведомления, read-модель. Клиенты узнают об изменениях
 через long polling.
 
+С внешним миром система связана тремя паттернами взаимодействия контекстов: с CRM и ERP —
+через Anti-Corruption Layer, с партнёрами — через Open-Host Service с опубликованным языком,
+а правила статусов и SLA она делит с CRM в Shared Kernel.
+
 Документ описывает устройство: абстрактное ядро, обе стороны CQRS, сагу и хореографию,
-полную схему команд и событий и протокол между клиентом и сервером. Как запустить и где что лежит — в
+интеграции, полную схему команд и событий и протоколы. Как запустить и где что лежит — в
 [README.md](README.md).
 
 - [1. Крейты и зависимости](#1-крейты-и-зависимости)
@@ -15,23 +19,32 @@ sourcing, запросы читают отдельную read-модель, ко
 - [3. Командная сторона](#3-командная-сторона)
 - [4. Запросная сторона](#4-запросная-сторона)
 - [5. Оркестрация и хореография](#5-оркестрация-и-хореография)
-- [6. Полная схема команд и событий](#6-полная-схема-команд-и-событий)
-- [7. Взаимодействие клиента и сервера](#7-взаимодействие-клиента-и-сервера)
-- [8. Гарантии и ограничения](#8-гарантии-и-ограничения)
+- [6. Интеграции: Shared Kernel, ACL, Open-Host Service](#6-интеграции-shared-kernel-acl-open-host-service)
+- [7. Полная схема команд и событий](#7-полная-схема-команд-и-событий)
+- [8. Взаимодействие клиента и сервера](#8-взаимодействие-клиента-и-сервера)
+- [9. Гарантии и ограничения](#9-гарантии-и-ограничения)
 
 ## 1. Крейты и зависимости
 
 ```mermaid
 flowchart BT
     framework["framework<br/>абстрактное ядро:<br/>event sourcing, CQRS, саги"]
-    ticketing["ticketing<br/>домен и сервис приложения"]
+    kernel["kernel<br/>Shared Kernel:<br/>статусы, SLA, время"]
+    ticketing["ticketing<br/>домен, сервис приложения,<br/>порты к CRM и ERP"]
+    external["external<br/>чужие системы: CRM, ERP"]
+    integration["integration<br/>ACL: CrmAdapter, ErpAdapter"]
     command["command<br/>командная сторона: актор"]
     query["query<br/>запросная сторона: read-модель"]
-    api["api<br/>HTTP-контракт: DTO и пути"]
-    server["server<br/>HTTP-адаптер, сборка системы"]
+    api["api<br/>внутренний HTTP-контракт"]
+    partner_api["partner_api<br/>Published Language v1"]
+    server["server<br/>HTTP, OHS, сборка системы"]
     client["client<br/>Leptos, wasm"]
 
     ticketing --> framework
+    ticketing --> kernel
+    external --> kernel
+    integration --> ticketing
+    integration --> external
     command --> ticketing
     command --> framework
     query --> ticketing
@@ -39,13 +52,21 @@ flowchart BT
     server --> command
     server --> query
     server --> api
+    server --> partner_api
+    server --> integration
     client --> api
+    client --> partner_api
 ```
 
 - `framework` не знает о тикетах и не зависит ни от чего (tokio — только в тестах).
+- `kernel` не зависит ни от чего. От него зависят и система тикетов, и CRM — в этом смысл
+  Shared Kernel.
+- `ticketing` не знает ни `external`, ни `integration`: к CRM и ERP он обращается через свои
+  порты, а реализуют их адаптеры ACL. Связывает их только `server`.
 - `command` и `query` не зависят друг от друга: общий у них только тип события
   `ticketing::domain::DomainEvent` и конверт `framework::cqrs::envelope::Envelope`.
-- Клиент знает только контракт `api` — ни домена, ни ядра.
+- Клиент знает только контракты `api` и `partner_api` — ни домена, ни ядра. Портал партнёра
+  в клиенте говорит только на `partner_api`, как настоящий партнёр.
 
 ## 2. Абстрактное ядро `framework`
 
@@ -138,9 +159,12 @@ flowchart LR
 | `Repository` над `in_memory` | три репозитория в `TicketService` (снапшот каждые 2 события) |
 | `CommandBus<C: Into<Command>>`, `EventSource<DomainEvent>` | `command::CommandActorHandle` |
 | `Subscription<DomainEvent>` | `command::EventSubscription` (обёртка над каналом tokio — правило сирот не даёт реализовать трейт для чужого типа напрямую) |
-| `Projection<DomainEvent>`, `QueryHandler<…>` для 10 запросов | `query::ReadModel` |
-| `Policy<DomainEvent>` | `ticketing::application::discount_policy::DiscountPolicy`, `ticketing::application::notifications::NotificationPolicy` |
+| `Projection<DomainEvent>`, `QueryHandler<…>` для 11 запросов | `query::ReadModel` |
+| `Policy<DomainEvent>` | `ticketing::application::discount_policy::DiscountPolicy`, `ticketing::application::notifications::NotificationPolicy`, `ticketing::application::customer_notices::CustomerNoticePolicy` |
 | `Saga` | `ticketing::application::ticket_lifecycle::TicketLifecycleSaga` |
+| `CustomerDirectory`, `CustomerNotifier` | `integration::crm::CrmAdapter` |
+| `Inventory` | `integration::erp::ErpAdapter` |
+| `Notifier` | `server::notifier::LogNotifier` |
 
 ## 3. Командная сторона
 
@@ -199,7 +223,7 @@ sequenceDiagram
 
 | View | Поля |
 |---|---|
-| `TicketView` | `ticket_id, category, description, status, assigned_agent, tenant_id, created_at, closed_at, close_reason, last_activity, reminders_sent, version`; `closes_at()` вычисляется из `last_activity` и поэтому не может с ней разойтись |
+| `TicketView` | `ticket_id, category, description, status, assigned_agent, tenant_id, created_at, closed_at, close_reason, last_activity, reminders_sent, tier, sla, sla_met, resources, partner (партнёр и время передачи), partner_updates, version`; `closes_at()` вычисляется из `last_activity` и поэтому не может с ней разойтись |
 | `TenantView` | `tenant_id, tenant_name, discount_rate, open_tickets, version` |
 | `UserView` | `user_id, user_name, role, version` |
 | `NotificationView` | `notification_id, recipient, ticket_id, kind, at, version` |
@@ -214,13 +238,14 @@ sequenceDiagram
 |---|---|
 | `active_by_agent: UserId → {TicketId}` — незакрытые тикеты агента | `ActiveTicketsOfAgent` |
 | `by_tenant: TenantId → {TicketId}` | `ListTickets { tenant_id }`, `UnassignedTicketsOfTenant` |
+| `by_partner: PartnerId → {TicketId}` — тикеты, переданные партнёру; при повторном открытии тикет уходит из индекса | `TicketsOfPartner` (для Open-Host Service) |
 | `closed: {(closed_at, TicketId)}` — упорядочен по времени | `TicketsClosedSince(t)` — диапазон `t..` |
 | `inbox: Recipient → [номер уведомления]` | `NotificationsOf(user)`: агенту — его личные, администратору — общие, остальным — ничего |
 | `changed: {(Version, запись)}` — каждая запись один раз, под последней версией | `ChangesSince(v)` — диапазон `v+1..` |
 
 Запросы: `GetTicket`, `ListTickets { status, tenant_id }`, `ActiveTicketsOfAgent`,
-`UnassignedTicketsOfTenant`, `TicketsClosedSince`, `GetTenant`, `ListTenants`, `ListUsers`,
-`NotificationsOf`, `ChangesSince`. Read-модель не знает текущего времени: «за последние N дней» превращает
+`UnassignedTicketsOfTenant`, `TicketsClosedSince`, `TicketsOfPartner`, `GetTenant`, `ListTenants`,
+`ListUsers`, `NotificationsOf`, `ChangesSince`. Read-модель не знает текущего времени: «за последние N дней» превращает
 в момент `since` сервер.
 
 ### 4.3. Применение событий
@@ -237,8 +262,9 @@ sequenceDiagram
 
 ## 5. Оркестрация и хореография
 
-`server::app` запускает рядом с актором четыре задачи tokio. Они не знают друг о друге:
-единственная связь между ними — журнал событий.
+`server::app` запускает рядом с актором шесть задач tokio. Они не знают друг о друге:
+единственная связь между ними — журнал событий. Две последние ходят во внешние системы —
+они описаны в [разделе 6](#6-интеграции-shared-kernel-acl-open-host-service).
 
 | Задача | Стиль | Что делает |
 |---|---|---|
@@ -246,6 +272,8 @@ sequenceDiagram
 | `run_policy(актор, v0, DiscountPolicy, актор)` | хореография | На события, меняющие число открытых тикетов, отправляет `ApplyDiscount`. `DiscountUnchanged` — норма, остальные отказы пишутся в stderr. |
 | `run_notifications(актор, v0, LogNotifier)` | хореография | Превращает события в уведомления и передаёт их порту `Notifier`. |
 | `run_projection(актор, ReadModel)` | хореография | Держит read-модель в актуальном состоянии. |
+| `run_resource_planning(актор, v0, ErpAdapter, партнёры, актор)` | хореография | На новый или открытый заново тикет спрашивает ERP, записывает ответ и, если ресурсов нет, передаёт тикет партнёру. |
+| `run_customer_notices(актор, v0, CrmAdapter)` | хореография | Сообщает клиенту через CRM о принятии, закрытии и повторном открытии тикета. |
 
 ```mermaid
 flowchart LR
@@ -258,6 +286,11 @@ flowchart LR
     pol -->|ApplyDiscount| actor
     actor -->|Envelope| notif["run_notifications<br/>NotificationPolicy"]
     notif --> port["Notifier: LogNotifier"]
+    actor -->|Envelope| plan["run_resource_planning"]
+    plan -->|Inventory| erp[("ERP через ACL")]
+    plan -->|"RecordResourceCheck, HandToPartner"| actor
+    actor -->|Envelope| cn["run_customer_notices"]
+    cn -->|CustomerNotifier| crm[("CRM через ACL")]
     actor -->|Envelope| proj["run_projection"]
     proj --> rm[("ReadModel")]
     rm -->|QueryHandler| q["HTTP: queries"]
@@ -269,7 +302,8 @@ flowchart LR
 ### 5.1. Оркестратор: `TicketLifecycleSaga`
 
 Один экземпляр на тикет. Сроки считаются от последней активности: создания, назначения
-агента или повторного открытия. Само напоминание активностью не считается.
+агента, повторного открытия или отчёта партнёра. Напоминание, проверка ресурсов и передача
+партнёру активностью не считаются: их делает система, а не люди.
 
 | День | Дедлайн | Команда | Результат |
 |---|---|---|---|
@@ -282,7 +316,7 @@ stateDiagram-v2
     [*] --> Running: TicketCreated, TicketReopened<br/>три срока от времени события
     Running --> [*]: TicketClosed<br/>дедлайны удалены
     note right of Running
-        AgentAssigned: все сроки заново
+        AgentAssigned, PartnerProgressReported: все сроки заново
         дедлайн напоминания: SendReminder
         дедлайн AutoClose: CloseTicket, ждём TicketClosed
     end note
@@ -323,6 +357,7 @@ API очереди узкий, поэтому заменить её позже �
 | `AgentAssigned` | `Assigned` → новый агент; `Unassigned` → прежний, если он был |
 | `ReminderSent` | `Reminder(kind)` → агент или, если его нет, администраторы |
 | `TicketClosed` | `Closed(reason)` → агент; без агента при `Inactivity` → администраторы, при `Resolved` → никто |
+| `ResourcesChecked`, `HandedToPartner`, `PartnerProgressReported` | — шаги интеграции, сотрудников о них уведомлять не нужно: они видны на карточке тикета |
 
 Доставка — порт `Notifier`: политика решает, кого уведомить, `run_notifications` передаёт
 уведомления порту, а сервер подключает `LogNotifier`, который пишет их в stdout. Настоящий канал
@@ -351,42 +386,253 @@ sequenceDiagram
     A->>O: TicketClosed — уведомление, read-модель, пересчёт скидки
 ```
 
-## 6. Полная схема команд и событий
+## 6. Интеграции: Shared Kernel, ACL, Open-Host Service
 
-### 6.1. Команды
+Бизнес-процесс задания проходит через три внешние стороны:
+
+1. тикет создаётся, если CRM знает клиента и его договор действует;
+2. ERP отвечает, хватает ли своих ресурсов (запчастей на складе);
+3. если не хватает — тикет передаётся партнёру, и тот отчитывается о работе;
+4. о результате клиенту сообщает CRM.
+
+С каждой стороной выбран свой способ взаимодействия контекстов:
+
+```mermaid
+flowchart LR
+    subgraph ours ["Контекст тикетов"]
+        intake["admit_ticket"]
+        plan["run_resource_planning"]
+        notices["run_customer_notices"]
+        ticket["агрегат Ticket"]
+        ohs["Open-Host Service<br/>server::partner"]
+    end
+    kernel[["Shared Kernel<br/>kernel: TicketStatus, Sla"]]
+    subgraph acl ["Anti-Corruption Layer: integration"]
+        crma["CrmAdapter"]
+        erpa["ErpAdapter"]
+    end
+    crm[("CRM<br/>external::crm")]
+    erp[("ERP<br/>external::erp")]
+    partner(["партнёры"])
+    pl[["Published Language<br/>partner_api v1"]]
+
+    ticket -.- kernel
+    crm -.- kernel
+    intake -->|CustomerDirectory| crma
+    notices -->|CustomerNotifier| crma
+    plan -->|Inventory| erpa
+    crma -->|CrmClient| crm
+    erpa -->|ErpClient| erp
+    partner -->|Bearer-токен| ohs
+    ohs -->|"ReportPartnerProgress,<br/>ResolveByPartner"| ticket
+    ohs -.- pl
+    partner -.- pl
+```
+
+| Сторона | Паттерн | Почему |
+|---|---|---|
+| CRM: правила | Shared Kernel | Статусы и SLA — договорённость двух команд: правила одни, меняют их вместе. |
+| CRM: протокол | Anti-Corruption Layer | Формат CRM чужой и устаревший: коды, номера счетов, миллисекунды. Его не пускают в домен. |
+| ERP | Anti-Corruption Layer | Чужая модель SAP-подобного склада: заводы, группы материалов, остатки и резервы. |
+| Партнёры | Open-Host Service + Published Language | Партнёров много, и каждому подстраиваться под нас дешевле, чем нам под каждого: один открытый версионированный протокол для всех. |
+
+### 6.1. Shared Kernel: `kernel`
+
+Крейт без зависимостей, от которого зависят и `ticketing`, и CRM (`external::crm`).
+
+| Тип | Правило |
+|---|---|
+| `TicketStatus` | `can_become(next)` разрешает ровно пять переходов: `Open → InProgress` (назначили агента), `InProgress → InProgress` (переназначили), `Open \| InProgress → Closed`, `Closed → Open`. `transition_to` возвращает новый статус или `InvalidTransition { from, to }`. |
+| `CustomerTier` | Gold, Silver, Bronze; `resolution_secs` — 1, 3 и 5 дней. |
+| `Sla` | Начало и отведённое время. `due_at()` — срок; `is_overdue(at)` — нарушено ли к моменту `at` (решение ровно в срок укладывается); `remaining_secs(at)`. Время передаётся снаружи: SLA одинаково считают агрегат, read-модель и CRM, его можно проверить тестами, и оно не ломается при `--time-scale`. |
+| `Timestamp`, `DAY_SECS` | Время в секундах, без переполнения при сложении. |
+
+Как ядро используют стороны:
+
+- **Агрегат `Ticket`** проверяет назначение, закрытие и повторное открытие через
+  `ensure_can_become`, который спрашивает `TicketStatus::transition_to`. Запрет он переводит
+  в свои ошибки `Closed` или `AlreadyOpen`: правило общее, а сообщение — на языке тикетов.
+  SLA агрегат считает сам: `Sla::for_tier(tier, at)` при создании и повторном открытии,
+  `!sla.is_overdue(at)` — в поле `sla_met` события `TicketClosed`.
+- **CRM** ведёт историю обращений клиента. Код состояния из запроса она переводит в
+  `TicketStatus` и проверяет `can_become`. Новое обращение начинается с `NEW`, после
+  `RESOLVED` повторное закрытие отвергается — так же, как в агрегате.
+
+`ticketing` реэкспортирует `kernel::time`, `kernel::sla` и `TicketStatus`, поэтому `command`,
+`query` и `server` пользуются ими как частью домена.
+
+### 6.2. Anti-Corruption Layer: порты и адаптеры
+
+Порты (`ticketing::application::ports`) описаны на языке тикетов:
+
+| Порт | Что спрашивает | Реализация |
+|---|---|---|
+| `CustomerDirectory::find_customer(tenant_id)` | `Option<CustomerProfile { name, email, tier, active }>` | `CrmAdapter` |
+| `CustomerNotifier::notify_customer(&CustomerNotice)` | `Received { due_at }`, `Closed { reason, sla_met }`, `Reopened { due_at }` | `CrmAdapter` |
+| `Inventory::check_resources(category)` | `ResourceAvailability::{Available, Unavailable}` | `ErpAdapter` |
+
+Сбой любой внешней системы — `ExternalError`, тоже без её терминов: `Unavailable` (не ответила,
+можно повторить) или `Rejected` (ответ нельзя перевести или запрос отвергнут).
+
+Чужие модели (`external`) и их перевод (`integration`):
+
+| Модель тикетов | CRM | Перевод |
+|---|---|---|
+| `TenantId(42)` | `acct_no: "ACC-000042"` | `account_number` |
+| `TicketId(7)` | `case_ref: "TKT-7"` | `case_reference` |
+| `CustomerTier` | `svc_lvl_cd: "GLD" \| "SLV" \| "BRZ"`; пусто — по умолчанию | `tier_from_code`: без учёта регистра, пустой код — Bronze, неизвестный (`PLT`) — `Rejected`, а не догадка |
+| `active: bool` | `acct_stat_cd: "A" \| "S" \| "C"` | `A` — активен, `S` и `C` — нет, остальное — `Rejected` |
+| `email: Option<String>` | `email_addr`, пустая строка — нет адреса | пустой → `None` |
+| `CustomerNoticeKind` | `case_stat: NEW, RESOLVED, AUTO_CLOSED, REOPENED`, `sla_met_flag: Y \| N \| ""`, `due_ts_ms` (0 — нет) | `to_case_activity`; секунды → миллисекунды без переполнения |
+| `ExternalError` | `CrmFault::{ServiceDown, NoSuchAccount, UnknownCaseStatus, InvalidCaseTransition}` | `ServiceDown` → `Unavailable`; `NoSuchAccount` при поиске → «клиента нет», остальное → `Rejected` |
+
+| Модель тикетов | ERP | Перевод |
+|---|---|---|
+| категория тикета | `ErpStockRequest { werks: "1000", matkl }` | `material_group`: `Hardware` → `MG-HW`, `Network` → `MG-NET`; для остальных ERP не спрашивают — ресурсы есть |
+| `ResourceAvailability` | `ErpStockLevel { labst, resb, meins }` | `availability`: `labst − resb > 0`; склад в минусе — ресурсов нет |
+| `ExternalError` | `ErpFault::{Timeout, UnknownPlant, UnknownMaterialGroup}` | `Timeout` → `Unavailable`, остальное → `Rejected` |
+
+Адаптеры обобщены по клиенту внешней системы (`CrmAdapter<C: CrmClient>`), поэтому в тестах
+их можно проверить и на `InMemoryCrm`, и на заглушке, которая отдаёт любые чужие записи.
+
+### 6.3. Процесс: приём, ресурсы, партнёр, сообщения клиенту
+
+**Приём тикета.** Актор выполняет команды по одной и не должен ждать внешних систем, поэтому
+CRM спрашивают до него: `admit_ticket` получает профиль клиента и достраивает
+`CreateTicketCommand` его уровнем. Неизвестный клиент — 404, неактивный — 409, CRM недоступна —
+503, CRM ответила непереводимо — 502.
+
+```mermaid
+sequenceDiagram
+    participant C as Клиент
+    participant H as HTTP
+    participant CRM as CrmAdapter → CRM
+    participant A as Актор
+    participant P as run_resource_planning
+    participant ERP as ErpAdapter → ERP
+    participant N as run_customer_notices
+
+    C->>H: POST /api/tickets (Hardware, Acme)
+    H->>CRM: find_customer(tenant-1)
+    CRM-->>H: Gold, active
+    H->>A: CreateTicket { tier: Gold }
+    A-->>H: Committed — 200
+    A->>N: TicketCreated
+    N->>CRM: Received { due_at: +1 день } → NEW
+    A->>P: TicketCreated
+    P->>ERP: check_resources("Hardware")
+    ERP-->>P: Unavailable (MG-HW: 2 − 2)
+    P->>A: RecordResourceCheck → ResourcesChecked
+    P->>A: HandToPartner(FixIt) → HandedToPartner
+```
+
+**Планирование ресурсов** (`run_resource_planning`) реагирует на `TicketCreated` и
+`TicketReopened`; категория есть в обоих событиях. Решения принимает агрегат:
+
+- `RecordResourceCheck` — один раз за заход, только для открытого тикета;
+- `HandToPartner` — только если ERP ответила `Unavailable`, и только одному партнёру.
+
+Партнёра выбирает `PartnerRoster` по категории. Сбой ERP, отсутствие подходящего партнёра или
+отказ агрегата уходят в `on_error`, цикл идёт дальше. Отказ `Closed` — норма: тикет закрыли,
+пока ERP думала.
+
+**Сообщения клиенту** (`run_customer_notices`) строит чистая `CustomerNoticePolicy`:
+`TicketCreated` → `Received`, `TicketClosed` → `Closed` с `sla_met`, `TicketReopened` →
+`Reopened`. Назначения, напоминания и работа с партнёрами — внутренняя кухня, о ней клиенту
+не пишут.
+
+### 6.4. Open-Host Service для партнёров
+
+Опубликованный язык — крейт `partner_api`, отдельный от внутреннего `api`: внутренний меняется
+вместе с нашим клиентом, а партнёрский — только новой версией (`/partner/v2`).
+
+| Метод и путь | Ответ |
+|---|---|
+| `GET /partner/v1/tickets` | `[PartnerTicket]` — тикеты, переданные партнёру, открытые и закрытые |
+| `GET /partner/v1/tickets/{id}` | `PartnerTicket` или 404 |
+| `POST /partner/v1/tickets/{id}/updates` с `{"status": "in_progress" \| "resolved", "comment": "..."}` | обновлённый `PartnerTicket` |
+
+- **`PartnerTicket`** — то, что нужно партнёру: категория, описание, имя клиента, статус
+  (`open`, `resolved`, `closed_for_inactivity`), время передачи, срок по SLA, время закрытия
+  и отчёты. Агенты, напоминания и ответы ERP в контракт не входят.
+- **Аутентификация.** `Authorization: Bearer <токен>` → `PartnerId` (экстрактор `PartnerAuth`).
+  Без токена или с неизвестным — 401 с `WWW-Authenticate: Bearer`.
+- **Изоляция.** Тикет другого партнёра или открытый заново для партнёра не существует — 404.
+  Сначала это проверяет read-модель (индекс `by_partner`), а в гонке — агрегат (`NotWithPartner`).
+- **Отчёты — команды агрегата.** `in_progress` даёт `ReportPartnerProgress`: нужен непустой
+  комментарий, и это активность — сага и read-модель сдвигают сроки. `resolved` даёт
+  `ResolveByPartner` — тот же `TicketClosed(Resolved)`, что при закрытии агентом, но проходит
+  только от партнёра этого тикета. Комментарий к `resolved` сначала записывается отдельным
+  отчётом.
+- **Ошибки** — `PartnerError { code, message }`: `unauthorized` 401, `not_found` 404,
+  `closed` 409, `invalid` 422, `unavailable` 503.
+- **Read-your-writes.** Ответ на `POST` приходит, когда read-модель дошла до версии команды:
+  следующий `GET` увидит отчёт.
+
+```mermaid
+sequenceDiagram
+    participant P as Партнёр FixIt
+    participant O as OHS
+    participant RM as ReadModel
+    participant A as Актор
+    participant N as run_customer_notices
+
+    P->>O: POST /partner/v1/tickets/4/updates (resolved, "Fuser replaced")
+    O->>RM: тикет 4 передан FixIt?
+    RM-->>O: да
+    O->>A: ReportPartnerProgress → PartnerProgressReported (v31)
+    O->>A: ResolveByPartner → TicketClosed(Resolved, sla_met) (v32)
+    O->>RM: wait_until(v32)
+    O-->>P: 200 PartnerTicket { status: resolved, updates: [...] }
+    A->>N: TicketClosed
+    N->>N: CRM: RESOLVED, sla_met_flag
+```
+
+## 7. Полная схема команд и событий
+
+### 7.1. Команды
 
 | Команда (`command::Command`) | Кто отправляет | Команда агрегата | Событие | Отказы → HTTP |
 |---|---|---|---|---|
 | `RegisterTenant` | `POST /api/tenants`, seed | `TenantCommand::Register` с выданным id | `TenantRegistered` | `EmptyName` 422 |
 | `RegisterUser` | `POST /api/users`, seed | `UserCommand::Register` с выданным id | `UserRegistered` | `EmptyName` 422 |
-| `CreateTicket` | `POST /api/tickets`, seed | `TicketCommand::Create` с id и временем | `TicketCreated` | `UnknownTenant` 404, `EmptyDescription` 422, `EmptyCategory` 422 |
+| `CreateTicket` | `POST /api/tickets` и seed — после `admit_ticket` | `TicketCommand::Create` с id, временем и уровнем клиента из CRM | `TicketCreated` | до команды: клиента нет в CRM 404, счёт не активен 409, CRM недоступна 503 / ответила непереводимо 502; в агрегате: `UnknownTenant` 404, `EmptyDescription` 422, `EmptyCategory` 422 |
 | `AssignAgent` | `POST /api/tickets/{id}/assign` | `TicketCommand::AssignAgent` с агрегатом `User` и временем | `AgentAssigned` | `UnknownUser` 404, `NotFound` 404, `NotAnAgent` 422, `AlreadyAssigned` 409, `Closed` 409 |
 | `CloseTicket` | `POST /api/tickets/{id}/close` (причина `Resolved`), сага (причина `Inactivity`) | `TicketCommand::Close` | `TicketClosed` | `NotFound` 404, `Closed` 409; для саги — `StillActive`, `Closed` (норма) |
 | `ReopenTicket` | `POST /api/tickets/{id}/open` | `TicketCommand::Reopen` | `TicketReopened` | `NotFound` 404, `AlreadyOpen` 409 |
 | `SendReminder` | сага | `TicketCommand::SendReminder { kind, at }` | `ReminderSent` | `ReminderNotDue`, `ReminderAlreadySent`, `Closed` (норма) |
 | `ApplyDiscount` | `DiscountPolicy` | `TenantCommand::ApplyDiscount` с числом открытых из `OpenTickets` | `DiscountApplied` | `NotFound`, `DiscountUnchanged` (норма) |
+| `RecordResourceCheck` | `run_resource_planning` | `TicketCommand::RecordResourceCheck { availability, at }` | `ResourcesChecked` | `ResourcesAlreadyChecked`, `Closed` (норма) |
+| `HandToPartner` | `run_resource_planning` | `TicketCommand::HandToPartner { partner_id, at }` | `HandedToPartner` | `PartnerNotNeeded`, `AlreadyWithPartner`, `Closed` (норма) |
+| `ReportPartnerProgress` | `POST /partner/v1/tickets/{id}/updates` (`in_progress`, а также комментарий к `resolved`) | `TicketCommand::ReportPartnerProgress { partner_id, comment, at }` | `PartnerProgressReported` | `NotWithPartner` 404, `EmptyComment` 422, `Closed` 409 |
+| `ResolveByPartner` | `POST /partner/v1/tickets/{id}/updates` (`resolved`) | `TicketCommand::ResolveByPartner { partner_id, at }` | `TicketClosed` (`Resolved`) | `NotWithPartner` 404, `Closed` 409 |
 
-### 6.2. События и их потребители
+### 7.2. События и их потребители
 
-| Событие | Поля | `TicketLifecycleSaga` | `OpenTickets` (запись) | `ReadModel` (чтение) | `DiscountPolicy` |
-|---|---|---|---|---|---|
-| `TenantRegistered` | `tenant_id, tenant_name` | — | — | новый `TenantView`: 0%, 0 открытых | — |
-| `UserRegistered` | `user_id, user_name, role` | — | — | новый `UserView` | — |
-| `TicketCreated` | `ticket_id, category, description, tenant_id, at` | старт, три срока | открытых +1 | новый `TicketView` (Open); `by_tenant`; тенант: открытых +1 | `ApplyDiscount(tenant_id)` |
-| `AgentAssigned` | `ticket_id, agent_id, previous_agent_id, at` | все сроки заново | — | агент, InProgress, активность, счётчик напоминаний 0; `active_by_agent`: от прежнего агента к новому | — |
-| `ReminderSent` | `ticket_id, agent_id, kind, at` | — | — | `reminders_sent` +1 | — |
-| `TicketClosed` | `ticket_id, tenant_id, agent_id, reason, at` | конец, дедлайны удалены | открытых −1 | Closed, `closed_at`, `close_reason`; убран из `active_by_agent`; в индекс `closed`; тенант: открытых −1 | `ApplyDiscount(tenant_id)` |
-| `TicketReopened` | `ticket_id, tenant_id, at` | старт заново | открытых +1 | Open, без агента, `closed_at` и `close_reason` сброшены, активность, счётчик 0; убран из `closed`; тенант: открытых +1 | `ApplyDiscount(tenant_id)` |
-| `DiscountApplied` | `tenant_id, previous_rate, discount_rate, open_tickets` | — | — | `discount_rate` тенанта | — (иначе политика реагировала бы на свой результат) |
+| Событие | Поля | `TicketLifecycleSaga` | `OpenTickets` (запись) | `ReadModel` (чтение) | `DiscountPolicy` | Интеграции |
+|---|---|---|---|---|---|---|
+| `TenantRegistered` | `tenant_id, tenant_name` | — | — | новый `TenantView`: 0%, 0 открытых | — | — |
+| `UserRegistered` | `user_id, user_name, role` | — | — | новый `UserView` | — | — |
+| `TicketCreated` | `ticket_id, category, description, tenant_id, tier, sla, at` | старт, три срока | открытых +1 | новый `TicketView` (Open, `tier`, `sla`); `by_tenant`; тенант: открытых +1 | `ApplyDiscount(tenant_id)` | планирование ресурсов; CRM: `Received` |
+| `AgentAssigned` | `ticket_id, agent_id, previous_agent_id, at` | все сроки заново | — | агент, InProgress, активность, счётчик напоминаний 0; `active_by_agent`: от прежнего агента к новому | — | — |
+| `ReminderSent` | `ticket_id, agent_id, kind, at` | — | — | `reminders_sent` +1 | — | — |
+| `TicketClosed` | `ticket_id, tenant_id, agent_id, reason, sla_met, at` | конец, дедлайны удалены | открытых −1 | Closed, `closed_at`, `close_reason`, `sla_met`; убран из `active_by_agent`; в индекс `closed`; тенант: открытых −1 | `ApplyDiscount(tenant_id)` | CRM: `Closed` |
+| `TicketReopened` | `ticket_id, tenant_id, category, sla, at` | старт заново | открытых +1 | Open, без агента и партнёра, новое `sla`, ресурсы и отчёты партнёра сброшены, `closed_at` и `close_reason` сброшены, активность, счётчик 0; убран из `closed` и `by_partner`; тенант: открытых +1 | `ApplyDiscount(tenant_id)` | планирование ресурсов; CRM: `Reopened` |
+| `ResourcesChecked` | `ticket_id, availability, at` | — | — | `resources` | — | — |
+| `HandedToPartner` | `ticket_id, partner_id, at` | — | — | `partner` с временем передачи; в `by_partner` | — | — |
+| `PartnerProgressReported` | `ticket_id, partner_id, comment, at` | все сроки заново | — | отчёт в `partner_updates`, активность, счётчик напоминаний 0 | — | — |
+| `DiscountApplied` | `tenant_id, previous_rate, discount_rate, open_tickets` | — | — | `discount_rate` тенанта | — (иначе политика реагировала бы на свой результат) | — |
 
 Какие уведомления порождают события — в [разделе 5.2](#52-хореография). `agent_id` в
 `ReminderSent` равен `None`, если агента нет: такое напоминание адресовано администраторам.
 
 Каждое событие меняет запись в read-модели и её версию, поэтому все они видны клиентам
-в `GET /api/changes`. `tenant_id` и `agent_id` в `TicketClosed` и `tenant_id` в `TicketReopened`
-есть именно ради потребителей: политика — чистая функция, ей нужно узнать всё из самого события.
+в `GET /api/changes`. `tenant_id` и `agent_id` в `TicketClosed`, `tenant_id` и `category`
+в `TicketReopened` есть именно ради потребителей: политика — чистая функция, ей нужно узнать
+всё из самого события. `sla` записано в события, а не пересчитывается: смена правил не
+меняет обещаний, уже данных клиенту.
 
-### 6.3. Пример: закрытие тикета, после которого пропадает скидка
+### 7.3. Пример: закрытие тикета, после которого пропадает скидка
 
 ```mermaid
 sequenceDiagram
@@ -407,20 +653,21 @@ sequenceDiagram
     A->>P: v20 DiscountApplied (игнорируется)
 ```
 
-## 7. Взаимодействие клиента и сервера
+## 8. Взаимодействие клиента и сервера
 
-### 7.1. HTTP API
+### 8.1. HTTP API
 
 Команды — `POST`, ответ `CommandAcceptedDto { version }`. Команда проверяется на командной
 стороне сразу, поэтому ошибки клиент получает в ответе: `{"error": "..."}` с кодом
-404 (нет объекта), 409 (противоречит состоянию), 422 (неверные данные), 503 (актор не работает).
+404 (нет объекта), 409 (противоречит состоянию), 422 (неверные данные), 503 (актор или CRM
+не отвечает), 502 (CRM ответила так, что ответ нельзя понять).
 
 | Метод и путь | Ответ |
 |---|---|
 | `POST /api/tickets/{id}/open` | `CommandAcceptedDto` |
 | `POST /api/tickets/{id}/close` | `CommandAcceptedDto` |
 | `POST /api/tickets/{id}/assign` с `{"agent_id": N}` | `CommandAcceptedDto` |
-| `POST /api/tenants` с `{"tenant_name": "..."}` | `CommandAcceptedDto` |
+| `POST /api/tenants` с `{"tenant_name": "...", "tier": "Gold\|Silver\|Bronze"}` | `CommandAcceptedDto`; заодно заводит счёт в CRM демо, `tier` необязателен (Bronze) |
 | `POST /api/users` с `{"user_name": "...", "role": "Customer\|Agent\|Admin"}` | `CommandAcceptedDto` |
 | `POST /api/tickets` с `{"category": "...", "description": "...", "tenant_id": N}` | `CommandAcceptedDto` |
 | `GET /api/tickets?status=Open\|InProgress\|Closed&tenant=N` | `[TicketDto]`, фильтры необязательны |
@@ -432,8 +679,12 @@ sequenceDiagram
 | `GET /api/users` | `[UserDto]` |
 | `GET /api/users/{id}/notifications` | `[NotificationDto]` — входящие пользователя, от старых к новым |
 | `GET /api/changes[?epoch=E&since=V]` | `ChangesDto` — long polling |
+| `/partner/v1/...` | Open-Host Service для партнёров — [раздел 6.4](#64-open-host-service-для-партнёров) |
 
-### 7.2. Long polling
+`TicketDto` кроме полей HW9 несёт `tier`, `sla_due_at`, `sla_met`, `resources`, `partner`
+(имя из справочника партнёров), `handed_over_at` и `partner_updates`.
+
+### 8.2. Long polling
 
 Позиция клиента — `Cursor { epoch, version }`. `epoch` — идентификатор запуска сервера:
 версии разных запусков несравнимы, а in-memory состояние после перезапуска другое.
@@ -451,7 +702,7 @@ sequenceDiagram
 `since` может обгонять read-модель: клиент получает версию команды раньше, чем проекция
 её применит. Тогда сервер просто ждёт — так клиент гарантированно видит собственные изменения.
 
-### 7.3. Клиент
+### 8.3. Клиент
 
 - **`Replica`** — копия read-модели сервера на клиенте. Полный ответ заменяет всё,
   дельта заменяет записи по одной. Уведомления всех получателей лежат здесь же, и
@@ -474,6 +725,13 @@ sequenceDiagram
   своих часов: при `--time-scale` они не совпадают с часами системы.
 - **Панель запросов** вызывает GET-запросы read-модели и выполняет выбранный запрос заново,
   когда long polling приносит изменения.
+- **Карточка тикета** показывает уровень клиента в CRM, срок SLA (у закрытого — уложились
+  ли), ответ ERP, партнёра и его отчёты. Форма тенанта выбирает уровень CRM.
+- **Портал партнёра** — отдельная пара `PartnerPortalService` и `PartnerViewModel`. Он знает
+  только токен и `partner_api` и ходит в `/partner/v1` с заголовком `Authorization`, как
+  приложение настоящего партнёра. Своей подписки у OHS нет, поэтому портал перечитывает список
+  после своих действий и когда основной клиент получает новую версию через long polling.
+  Отозванный токен (401) выводит из портала.
 
 ```mermaid
 sequenceDiagram
@@ -499,7 +757,7 @@ sequenceDiagram
     S-->>B: v20: Acme 0%
 ```
 
-## 8. Гарантии и ограничения
+## 9. Гарантии и ограничения
 
 - **Согласованность.** Командная сторона строго согласована: один писатель, проверки
   в агрегате. Read-модель, скидка и сага согласованы в конечном счёте: обновляются асинхронно,
@@ -512,11 +770,17 @@ sequenceDiagram
   на тик (по умолчанию 1 с) плюс очередь других дедлайнов. Раньше срока команда не пройдёт:
   это проверяет агрегат. При `--time-scale` тик сокращается, чтобы опоздание было не больше минуты
   времени системы, но не короче 10 мс.
-- **Доставка уведомлений — не более одного раза.** Отказ `Notifier` уходит в обработчик ошибок,
-  повторов нет. `run_notifications` не хранит свою позицию: с постоянным журналом перезапуск
+- **Доставка уведомлений и обращения к CRM и ERP — не более одного раза.** Отказ `Notifier`,
+  `CustomerNotifier` или `Inventory` уходит в обработчик ошибок, повторов нет. Если ERP не
+  ответила, тикет остаётся без проверки ресурсов; если CRM пропустила `NEW`, следующее
+  сообщение о том же обращении она отвергнет по правилам переходов. `run_notifications` не хранит свою позицию: с постоянным журналом перезапуск
   прислал бы всё заново, поэтому там понадобились бы сохранённая позиция и идемпотентный получатель.
-- **Нет авторизации.** Long polling приносит уведомления всех получателей, и клиент отбирает
-  нужные сам. В настоящей системе сервер фильтровал бы их по вошедшему пользователю.
+- **Нет авторизации сотрудников.** Long polling приносит уведомления всех получателей, и клиент
+  отбирает нужные сам. В настоящей системе сервер фильтровал бы их по вошедшему пользователю.
+  Партнёры аутентифицируются, но токены — константы демо, без выдачи, отзыва и срока действия.
+- **Решение партнёра с комментарием — две команды.** Если закрытие отклонят, отчёт останется.
+- **Справочники в коде.** Связь категорий тикетов с группами материалов ERP — в `ErpAdapter`,
+  партнёры и их категории — в `ExternalSystems::demo`.
 - **Нет постраничной выдачи и отметок о прочтении.** Журнал, входящие и полный ответ
   `/api/changes` растут вместе с историей.
 - **Хранение в памяти.** Всё состояние живёт в одном процессе и пропадает при перезапуске;
