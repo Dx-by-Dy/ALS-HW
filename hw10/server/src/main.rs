@@ -122,10 +122,10 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     if options.seed {
-        seed(&app.commands).await?;
+        seed(&app).await?;
     }
     if !Path::new(CLIENT_DIST).join("index.html").exists() {
-        eprintln!("warning: client is not built, run `trunk build` in hw9/client");
+        eprintln!("warning: client is not built, run `trunk build` in hw10/client");
     }
     let router = app.router.fallback_service(ServeDir::new(CLIENT_DIST));
 

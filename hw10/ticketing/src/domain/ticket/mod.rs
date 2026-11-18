@@ -146,6 +146,7 @@ impl Ticket {
         Ok(TicketEvent::Reopened(TicketReopenedEvent {
             ticket_id: self.ticket_id,
             tenant_id: self.tenant,
+            category: self.category.clone(),
             sla: Sla::for_tier(self.tier, at),
             at,
         }))
@@ -688,6 +689,7 @@ mod tests {
             Ok(TicketEvent::Reopened(TicketReopenedEvent {
                 ticket_id: TicketId(1),
                 tenant_id: TenantId(1),
+                category: "Technical Issue".to_owned(),
                 sla: Sla::for_tier(CustomerTier::Bronze, at),
                 at,
             }))

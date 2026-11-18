@@ -1,12 +1,12 @@
 //! Перевод моделей представления в DTO контракта `api` и обратно.
 
 use api::{
-    ChangesDto, CloseReason, NotificationDto, NotificationKind, Recipient, ReminderKind, Role,
-    TenantDto, TicketDto, TicketStatus, UserDto,
+    ChangesDto, CloseReason, CustomerTier, NotificationDto, NotificationKind, Recipient,
+    ReminderKind, Role, TenantDto, TicketDto, TicketStatus, UserDto,
 };
 use query::views::{Changes, NotificationView, TenantView, TicketView, UserView};
 use ticketing::application::notifications;
-use ticketing::domain::{ticket, user};
+use ticketing::domain::{sla, ticket, user};
 
 pub fn ticket_dto(ticket: &TicketView) -> TicketDto {
     TicketDto {
@@ -80,6 +80,14 @@ pub fn role(role: Role) -> user::Role {
         Role::Customer => user::Role::Customer,
         Role::Agent => user::Role::Agent,
         Role::Admin => user::Role::Admin,
+    }
+}
+
+pub fn tier(tier: CustomerTier) -> sla::CustomerTier {
+    match tier {
+        CustomerTier::Gold => sla::CustomerTier::Gold,
+        CustomerTier::Silver => sla::CustomerTier::Silver,
+        CustomerTier::Bronze => sla::CustomerTier::Bronze,
     }
 }
 

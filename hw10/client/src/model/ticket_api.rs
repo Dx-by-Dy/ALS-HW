@@ -323,7 +323,7 @@ mod tests {
                 (
                     Method::Post,
                     "/api/tenants".to_owned(),
-                    r#"{"tenant_name":"Acme"}"#.to_owned()
+                    r#"{"tenant_name":"Acme","tier":"Bronze"}"#.to_owned()
                 ),
                 (
                     Method::Post,

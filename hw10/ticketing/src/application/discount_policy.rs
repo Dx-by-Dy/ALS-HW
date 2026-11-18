@@ -78,6 +78,7 @@ mod tests {
         let reopened = TicketEvent::Reopened(TicketReopenedEvent {
             ticket_id: TICKET,
             tenant_id: ACME,
+            category: "Technical Issue".to_owned(),
             sla: Sla::for_tier(CustomerTier::Bronze, Timestamp(0)),
             at: Timestamp(0),
         });

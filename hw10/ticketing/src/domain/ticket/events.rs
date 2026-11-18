@@ -56,6 +56,8 @@ pub struct TicketReopenedEvent {
     pub ticket_id: TicketId,
     /// Нужен тем, кто следит за тикетами тенанта: проекциям и политике скидок.
     pub tenant_id: TenantId,
+    /// Нужна планированию ресурсов: ресурсы проверяют заново.
+    pub category: String,
     /// Новое SLA: открытый заново тикет решают с начала.
     pub sla: Sla,
     pub at: Timestamp,

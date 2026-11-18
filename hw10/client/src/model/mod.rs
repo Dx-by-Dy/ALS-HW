@@ -16,8 +16,8 @@ use std::error::Error;
 use std::fmt;
 
 use api::{
-    CreateTenantRequest, CreateTicketRequest, CreateUserRequest, Role, TicketDto, TicketStatus,
-    UserDto,
+    CreateTenantRequest, CreateTicketRequest, CreateUserRequest, CustomerTier, Role, TicketDto,
+    TicketStatus, UserDto,
 };
 
 /// Правила допустимости команд над тикетом. Данные модели — DTO из `api`, а правила
@@ -70,6 +70,7 @@ impl TicketRules for TicketDto {
 pub fn new_tenant(name: &str) -> Result<CreateTenantRequest, ValidationError> {
     Ok(CreateTenantRequest {
         tenant_name: required("tenant name", name)?,
+        tier: CustomerTier::default(),
     })
 }
 

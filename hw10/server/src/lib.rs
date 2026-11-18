@@ -2,8 +2,9 @@
 //!
 //! [`app`] собирает систему целиком. Кроме актора, в отдельных задачах tokio работают
 //! проекция (события → read-модель), политика скидок (события → команды), уведомления
-//! (события → журнал сервера) и оркестратор жизненного цикла тикетов с напоминаниями
-//! и автозакрытием. Клиенты узнают об изменениях через long polling
+//! (события → журнал сервера), оркестратор жизненного цикла тикетов с напоминаниями
+//! и автозакрытием, планирование ресурсов (события → ERP → команды) и сообщения клиентам
+//! (события → CRM). Клиенты узнают об изменениях через long polling
 //! `GET /api/changes?since=N`.
 
 mod commands;
@@ -12,6 +13,7 @@ mod error;
 mod notifier;
 mod queries;
 mod seed;
+mod world;
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -28,14 +30,16 @@ use framework::cqrs::{
 };
 use query::ReadModel;
 use ticketing::application::{
-    clock::Clock, discount_policy::DiscountPolicy, error::ServiceError,
-    notifications::run_notifications, ticket_service::TicketService,
+    clock::Clock, customer_notices::run_customer_notices, discount_policy::DiscountPolicy,
+    error::ServiceError, notifications::run_notifications, resource_planning::PlanningError,
+    resource_planning::run_resource_planning, ticket_service::TicketService,
 };
 use ticketing::domain::{DomainEvent, tenant::TenantError, ticket::TicketError};
 
 pub use error::ApiError;
 use notifier::LogNotifier;
 pub use seed::seed;
+pub use world::{ExternalSystems, FIXIT, NETCO};
 
 type ApiResult<T> = Result<Json<T>, ApiError>;
 type Shared = State<Arc<AppState>>;
@@ -77,11 +81,16 @@ pub struct App {
     pub router: Router,
     pub commands: CommandActorHandle,
     pub read_model: ReadModel,
+    /// CRM, ERP и партнёры, с которыми работает система.
+    pub external: ExternalSystems,
 }
 
 struct AppState {
     commands: CommandActorHandle,
     read_model: ReadModel,
+    /// Справочник клиентов для приёма тикетов.
+    crm: world::Crm,
+    external: ExternalSystems,
     /// Для запросов «за последние N дней»: read-модель о текущем времени не знает.
     clock: Arc<dyn Clock + Send + Sync>,
     long_poll: Duration,
@@ -89,19 +98,25 @@ struct AppState {
     epoch: u64,
 }
 
-/// Запускает командную сторону, проекцию, политику скидок, уведомления и оркестратор в задачах tokio
-/// и возвращает роутер над ними. Должна вызываться внутри рантайма tokio.
+/// Запускает командную сторону, проекцию, политики, уведомления, оркестратор и интеграции
+/// в задачах tokio и возвращает роутер над ними. Внешний мир — [`ExternalSystems::demo`].
+/// Должна вызываться внутри рантайма tokio.
 pub fn app<C: Clock + Clone + Send + Sync + 'static>(clock: C, config: Config) -> App {
     let commands = command::spawn(TicketService::new(clock.clone()));
     let read_model = ReadModel::default();
+    let external = ExternalSystems::demo();
     spawn_projection(&commands, &read_model);
     spawn_discount_policy(&commands);
     spawn_notifications(&commands);
     spawn_ticket_lifecycle(&commands, clock.clone(), config.deadline_tick);
+    spawn_resource_planning(&commands, &external);
+    spawn_customer_notices(&commands, &external);
 
     let state = Arc::new(AppState {
         commands: commands.clone(),
         read_model: read_model.clone(),
+        crm: external.crm_adapter(),
+        external: external.clone(),
         clock: Arc::new(clock),
         long_poll: config.long_poll,
         epoch: new_epoch(),
@@ -143,6 +158,7 @@ pub fn app<C: Clock + Clone + Send + Sync + 'static>(clock: C, config: Config) -
         router,
         commands,
         read_model,
+        external,
     }
 }
 
@@ -207,6 +223,46 @@ where
     });
 }
 
+fn spawn_resource_planning(commands: &CommandActorHandle, external: &ExternalSystems) {
+    let bus = commands.clone();
+    let (erp, partners) = (external.erp_adapter(), external.partners.clone());
+    tokio::spawn(async move {
+        let result = run_resource_planning(&bus, Version(0), &erp, &partners, &bus, |e| match e {
+            PlanningError::Command(e) if is_outdated_planning(&e) => {}
+            e => eprintln!("warning: resource planning: {e}"),
+        })
+        .await;
+        if let Err(e) = result {
+            eprintln!("error: resource planning stopped: {e}");
+        }
+    });
+}
+
+fn spawn_customer_notices(commands: &CommandActorHandle, external: &ExternalSystems) {
+    let source = commands.clone();
+    let crm = external.crm_adapter();
+    tokio::spawn(async move {
+        let result = run_customer_notices(&source, Version(0), &crm, |notice, e| {
+            eprintln!(
+                "warning: customer of {} was not told about {}: {e}",
+                notice.tenant_id, notice.ticket_id
+            );
+        })
+        .await;
+        if let Err(e) = result {
+            eprintln!("error: customer notices stopped: {e}");
+        }
+    });
+}
+
+/// Тикет закрыли, пока ERP думала: проверять ресурсы и звать партнёра уже незачем.
+fn is_outdated_planning(e: &CommandError) -> bool {
+    matches!(
+        e,
+        CommandError::Rejected(ServiceError::Ticket(TicketError::Closed(_)))
+    )
+}
+
 /// Дедлайн устарел, пока команда шла к агрегату: в тикете появилась активность,
 /// его уже закрыли или напоминание больше не нужно. Это обычный исход, а не сбой.
 fn is_outdated_deadline(e: &CommandError) -> bool {
@@ -241,10 +297,12 @@ mod tests {
         body::Body,
         http::{Request, StatusCode, header},
     };
+    use external::crm::{CrmAccount, CrmCaseActivity};
     use http_body_util::BodyExt;
     use serde::de::DeserializeOwned;
     use ticketing::application::clock::{ManualClock, ScaledClock};
     use ticketing::domain::ticket::{INACTIVITY_TIMEOUT_SECS, STALE_REMINDER_AFTER_SECS};
+    use ticketing::domain::ticket::{ResourceAvailability, TicketEvent};
     use tower::ServiceExt;
 
     /// Номера тикетов и пользователей из [`seed`].
@@ -265,6 +323,8 @@ mod tests {
     struct TestApp {
         router: Router,
         clock: ManualClock,
+        commands: CommandActorHandle,
+        external: ExternalSystems,
         /// Позиция после того, как всё разошлось.
         settled: Cursor,
     }
@@ -280,13 +340,15 @@ mod tests {
     async fn settled_app_with(config: Config) -> TestApp {
         let clock = ManualClock::default();
         let app = app(clock.clone(), config);
-        seed(&app.commands).await.unwrap();
+        seed(&app).await.unwrap();
         let router = app.router;
         wait_for_tenant(&router, ACME, |t| t.discount_percent == 10).await;
         let all: ChangesDto = get(&router, &api::changes(None)).await;
         TestApp {
             router,
             clock,
+            commands: app.commands,
+            external: app.external,
             settled: all.cursor(),
         }
     }
@@ -306,6 +368,8 @@ mod tests {
         TestApp {
             router,
             clock,
+            commands: app.commands,
+            external: app.external,
             settled: all.cursor(),
         }
     }
@@ -364,6 +428,39 @@ mod tests {
             let changes: ChangesDto = self.get(&api::changes(Some(before))).await;
             assert!(changes.version >= accepted.version);
             accepted.version
+        }
+
+        /// Ждёт в общем журнале событие, для которого `pick` что-то возвращает.
+        async fn wait_for_event<T>(&self, pick: impl Fn(&DomainEvent) -> Option<T>) -> T {
+            use framework::cqrs::event_source::{EventSource, Subscription};
+            let wait = async {
+                let mut events = self.commands.subscribe(Version(0)).await.unwrap();
+                while let Some(envelope) = events.next().await {
+                    if let Some(found) = pick(&envelope.event) {
+                        return found;
+                    }
+                }
+                panic!("event stream closed");
+            };
+            tokio::time::timeout(WAIT, wait)
+                .await
+                .expect("expected event was recorded")
+        }
+
+        /// Ждёт, пока в истории обращений CRM наберётся `count` записей.
+        async fn wait_for_crm_history(&self, count: usize) -> Vec<CrmCaseActivity> {
+            let wait = async {
+                loop {
+                    let history = self.external.crm.activities();
+                    if history.len() >= count {
+                        return history;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            };
+            tokio::time::timeout(WAIT, wait)
+                .await
+                .expect("CRM received the notices")
         }
     }
 
@@ -808,5 +905,92 @@ mod tests {
         app.command(&api::open_ticket(OPEN), None).await;
         let acme = wait_for_tenant(&app.router, ACME, |t| t.discount_percent == 10).await;
         assert_eq!(acme.open_tickets, 6);
+    }
+
+    // --- Интеграция с CRM, ERP и партнёрами ---
+
+    #[tokio::test]
+    async fn crm_decides_who_may_open_tickets() {
+        let app = empty_app(NEVER).await;
+        app.command(api::TENANTS, Some(r#"{"tenant_name":"Acme"}"#))
+            .await;
+        let ticket = r#"{"category":"Billing","description":"Invoice","tenant_id":1}"#;
+        app.command(api::TICKETS, Some(ticket)).await;
+
+        let suspended = CrmAccount {
+            acct_stat_cd: "S".to_owned(),
+            ..integration::crm::new_account(
+                ticketing::domain::tenant::TenantId(1),
+                "Acme",
+                ticketing::domain::sla::CustomerTier::Bronze,
+            )
+        };
+        app.external.crm.upsert_account(suspended);
+        let (status, error): (_, ErrorDto) = app.send("POST", api::TICKETS, Some(ticket)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            error.error,
+            "tenant-1 cannot open tickets: the CRM account is not active"
+        );
+
+        app.external.crm.set_down(true);
+        let (status, _): (_, ErrorDto) = app.send("POST", api::TICKETS, Some(ticket)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn customer_hears_about_ticket_through_crm() {
+        let app = empty_app(NEVER).await;
+        app.clock.advance(1_000);
+        app.command(
+            api::TENANTS,
+            Some(r#"{"tenant_name":"Acme","tier":"Gold"}"#),
+        )
+        .await;
+        let ticket = r#"{"category":"Billing","description":"Invoice","tenant_id":1}"#;
+        app.command(api::TICKETS, Some(ticket)).await;
+        app.clock.advance(DAY + 1);
+        app.command(&api::close_ticket(1), None).await;
+
+        let history = app.wait_for_crm_history(2).await;
+        assert_eq!(
+            history[0],
+            CrmCaseActivity {
+                acct_no: "ACC-000001".to_owned(),
+                case_ref: "TKT-1".to_owned(),
+                case_stat: "NEW".to_owned(),
+                sla_met_flag: String::new(),
+                due_ts_ms: (1_000 + DAY) * 1_000,
+                actv_ts_ms: 1_000_000,
+            }
+        );
+        assert_eq!(history[1].case_stat, "RESOLVED");
+        assert_eq!(
+            history[1].sla_met_flag, "N",
+            "Gold has one day, it took longer"
+        );
+    }
+
+    #[tokio::test]
+    async fn ticket_without_parts_goes_to_partner_and_with_parts_stays() {
+        let app = seeded_app().await;
+        // Принтер (тикет 4) — Hardware, запчастей нет; VPN (тикет 1) — Network, оборудование есть.
+        let handed = app
+            .wait_for_event(|event| match event {
+                DomainEvent::Ticket(TicketEvent::HandedToPartner(e)) => Some(e.clone()),
+                _ => None,
+            })
+            .await;
+        assert_eq!(handed.ticket_id.0, 4);
+        assert_eq!(handed.partner_id, FIXIT);
+        let vpn = app
+            .wait_for_event(|event| match event {
+                DomainEvent::Ticket(TicketEvent::ResourcesChecked(e)) if e.ticket_id.0 == 1 => {
+                    Some(e.availability)
+                }
+                _ => None,
+            })
+            .await;
+        assert_eq!(vpn, ResourceAvailability::Available);
     }
 }

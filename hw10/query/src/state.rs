@@ -538,6 +538,7 @@ pub(crate) mod tests {
         TicketEvent::Reopened(TicketReopenedEvent {
             ticket_id: TicketId(ticket),
             tenant_id,
+            category: "Technical Issue".to_owned(),
             sla: Sla::for_tier(CustomerTier::Bronze, Timestamp(0)),
             at: Timestamp(0),
         })

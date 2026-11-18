@@ -807,7 +807,10 @@ mod tests {
 
         let request = last_request(&http);
         assert_eq!(request.path, "/api/tenants");
-        assert_eq!(request.body.as_deref(), Some(r#"{"tenant_name":"Acme"}"#));
+        assert_eq!(
+            request.body.as_deref(),
+            Some(r#"{"tenant_name":"Acme","tier":"Bronze"}"#)
+        );
         assert_eq!(vm.forms.tenant_name.get(), "");
         // Тенант появится только из потока изменений, до тех пор модель занята.
         assert!(vm.is_busy());

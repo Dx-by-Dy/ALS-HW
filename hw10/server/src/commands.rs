@@ -12,25 +12,40 @@ use axum::{
 };
 use command::{Command, CommandError};
 use framework::cqrs::{command_bus::CommandBus, envelope::Committed};
-use ticketing::application::commands::{
-    AssignAgentCommand, CloseTicketCommand, CreateTicketCommand, RegisterTenantCommand,
-    RegisterUserCommand, ReopenTicketCommand,
+use ticketing::application::{
+    commands::{
+        AssignAgentCommand, CloseTicketCommand, RegisterTenantCommand, RegisterUserCommand,
+        ReopenTicketCommand,
+    },
+    intake::admit_ticket,
 };
 use ticketing::domain::{
     DomainEvent,
-    sla::CustomerTier,
-    tenant::TenantId,
+    tenant::{TenantEvent, TenantId},
     ticket::{CloseReason, TicketId},
     user::UserId,
 };
 
 use crate::{ApiResult, Shared, dto};
 
+/// Регистрирует тенанта и заводит ему счёт в CRM с запрошенным уровнем.
 pub async fn create_tenant(
     State(state): Shared,
     Json(request): Json<CreateTenantRequest>,
 ) -> ApiResult<CommandAcceptedDto> {
-    send(&state, RegisterTenantCommand::new(request.tenant_name)).await
+    let command = RegisterTenantCommand::new(request.tenant_name);
+    let committed = state.commands.send(command).await?;
+    for envelope in &committed.events {
+        if let DomainEvent::Tenant(TenantEvent::Registered(e)) = &envelope.event {
+            let tier = dto::tier(request.tier);
+            state
+                .external
+                .open_account(e.tenant_id, &e.tenant_name, tier);
+        }
+    }
+    Ok(Json(CommandAcceptedDto {
+        version: committed.version.0,
+    }))
 }
 
 pub async fn create_user(
@@ -45,13 +60,13 @@ pub async fn create_ticket(
     State(state): Shared,
     Json(request): Json<CreateTicketRequest>,
 ) -> ApiResult<CommandAcceptedDto> {
-    // Уровень клиента пока не спрашиваем у CRM: все клиенты считаются Bronze.
-    let command = CreateTicketCommand::new(
+    let command = admit_ticket(
+        &state.crm,
         request.category,
         request.description,
         TenantId(request.tenant_id),
-        CustomerTier::Bronze,
-    );
+    )
+    .await?;
     send(&state, command).await
 }
 

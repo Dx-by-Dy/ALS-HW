@@ -6,7 +6,9 @@ edition.workspace = true
 [dependencies]
 api = { path = "../api" }
 command = { path = "../command" }
+external = { path = "../external" }
 framework = { path = "../framework" }
+integration = { path = "../integration" }
 query = { path = "../query" }
 ticketing = { path = "../ticketing" }
 axum = "0.8"

@@ -96,6 +96,7 @@ mod tests {
         view.project(&TicketEvent::Reopened(TicketReopenedEvent {
             ticket_id: TicketId(1),
             tenant_id: TenantId(1),
+            category: "Technical Issue".to_owned(),
             sla: Sla::for_tier(CustomerTier::Bronze, Timestamp(0)),
             at: Timestamp(0),
         }));

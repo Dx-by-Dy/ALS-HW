@@ -5,7 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use command::CommandError;
-use ticketing::application::error::ServiceError;
+use ticketing::application::{error::ServiceError, intake::IntakeError, ports::ExternalError};
 use ticketing::domain::{tenant::TenantError, ticket::TicketError, user::UserError};
 
 /// Ошибка, которую обработчик отдаёт клиенту: HTTP-статус и текст для `ErrorDto`.
@@ -40,6 +40,21 @@ impl From<ServiceError> for ApiError {
     fn from(e: ServiceError) -> Self {
         Self {
             status: status_of(&e),
+            message: e.to_string(),
+        }
+    }
+}
+
+impl From<IntakeError> for ApiError {
+    fn from(e: IntakeError) -> Self {
+        let status = match &e {
+            IntakeError::UnknownCustomer(_) => StatusCode::NOT_FOUND,
+            IntakeError::InactiveCustomer(_) => StatusCode::CONFLICT,
+            IntakeError::Crm(ExternalError::Unavailable { .. }) => StatusCode::SERVICE_UNAVAILABLE,
+            IntakeError::Crm(ExternalError::Rejected { .. }) => StatusCode::BAD_GATEWAY,
+        };
+        Self {
+            status,
             message: e.to_string(),
         }
     }

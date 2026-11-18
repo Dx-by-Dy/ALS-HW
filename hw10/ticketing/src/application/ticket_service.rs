@@ -544,6 +544,7 @@ mod tests {
             Ok(TicketEvent::Reopened(TicketReopenedEvent {
                 ticket_id,
                 tenant_id: f.tenant_id,
+                category: "Technical Issue".to_owned(),
                 sla: Sla::for_tier(CustomerTier::Bronze, Timestamp(60)),
                 at: Timestamp(60),
             }))

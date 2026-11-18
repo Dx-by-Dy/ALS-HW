@@ -82,6 +82,26 @@ impl fmt::Display for TicketStatus {
     }
 }
 
+/// Уровень обслуживания клиента в CRM: от него зависит SLA.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CustomerTier {
+    Gold,
+    Silver,
+    #[default]
+    Bronze,
+}
+
+impl fmt::Display for CustomerTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Gold => "Gold",
+            Self::Silver => "Silver",
+            Self::Bronze => "Bronze",
+        };
+        f.write_str(name)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
     Customer,
@@ -216,6 +236,9 @@ pub struct TenantDto {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateTenantRequest {
     pub tenant_name: String,
+    /// С каким уровнем завести клиента в CRM; если не указан — Bronze.
+    #[serde(default)]
+    pub tier: CustomerTier,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
