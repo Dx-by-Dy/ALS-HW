@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 framework = { path = "../framework" }
+kernel = { path = "../kernel" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }

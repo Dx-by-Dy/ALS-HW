@@ -1,7 +1,6 @@
 mod command;
 mod error;
 mod events;
-mod status;
 
 use std::fmt;
 
@@ -11,16 +10,15 @@ pub use events::{
     AgentAssignedEvent, ReminderSentEvent, TicketClosedEvent, TicketCreatedEvent, TicketEvent,
     TicketReopenedEvent,
 };
-pub use status::TicketStatus;
+/// Статус и правила переходов — из Shared Kernel: их же соблюдает CRM.
+pub use kernel::status::TicketStatus;
 
 use crate::domain::{
     tenant::TenantId,
-    time::Timestamp,
+    time::{DAY_SECS, Timestamp},
     user::{Role, User, UserId},
 };
 use framework::event_sourcing::{event_store::StreamId, lifecycle::Lifecycle};
-
-const DAY_SECS: u64 = 24 * 60 * 60;
 
 /// Сколько тикет может простоять без активности, прежде чем его закроют: 10 дней.
 pub const INACTIVITY_TIMEOUT_SECS: u64 = 10 * DAY_SECS;
@@ -93,7 +91,7 @@ impl Ticket {
 
     /// Решение о назначении агента. Повторное назначение другого агента разрешено.
     pub fn assign_agent(&self, agent: &User, at: Timestamp) -> Result<TicketEvent, TicketError> {
-        self.ensure_open()?;
+        self.ensure_can_become(TicketStatus::InProgress)?;
         if agent.role() != Role::Agent {
             return Err(TicketError::NotAnAgent {
                 user_id: agent.user_id(),
@@ -113,7 +111,7 @@ impl Ticket {
 
     /// Решение о закрытии. По неактивности закрыть можно, только если таймаут истёк.
     pub fn close(&self, reason: CloseReason, at: Timestamp) -> Result<TicketEvent, TicketError> {
-        self.ensure_open()?;
+        self.ensure_can_become(TicketStatus::Closed)?;
         if reason == CloseReason::Inactivity && !inactivity_expired(self.last_activity, at) {
             return Err(TicketError::StillActive {
                 idle_secs: at.secs_since(self.last_activity),
@@ -131,9 +129,7 @@ impl Ticket {
     /// Решение об открытии закрытого тикета. Он начинает жизнь заново: без агента
     /// и с новым отсчётом неактивности.
     pub fn reopen(&self, at: Timestamp) -> Result<TicketEvent, TicketError> {
-        if self.status.is_open() {
-            return Err(TicketError::AlreadyOpen(self.ticket_id));
-        }
+        self.ensure_can_become(TicketStatus::Open)?;
         Ok(TicketEvent::Reopened(TicketReopenedEvent {
             ticket_id: self.ticket_id,
             tenant_id: self.tenant,
@@ -192,6 +188,23 @@ impl Ticket {
         self.last_activity
     }
 
+    /// Проверяет по правилам Shared Kernel, что тикет может перейти в статус `next`.
+    ///
+    /// Запрещённый переход из закрытого статуса означает, что тикет закрыт; из открытого —
+    /// что его пытаются открыть ещё раз: других запрещённых переходов правила не оставляют.
+    fn ensure_can_become(&self, next: TicketStatus) -> Result<(), TicketError> {
+        self.status
+            .transition_to(next)
+            .map(drop)
+            .map_err(|invalid| match invalid.from {
+                TicketStatus::Closed => TicketError::Closed(self.ticket_id),
+                TicketStatus::Open | TicketStatus::InProgress => {
+                    TicketError::AlreadyOpen(self.ticket_id)
+                }
+            })
+    }
+
+    /// Напоминание статус не меняет, но закрытому тикету оно не нужно.
     fn ensure_open(&self) -> Result<(), TicketError> {
         if self.status.is_open() {
             Ok(())

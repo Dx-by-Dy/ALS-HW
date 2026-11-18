@@ -852,6 +852,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernel"
+version = "0.1.0"
+
+[[package]]
 name = "konst"
 version = "0.2.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1733,6 +1737,7 @@ name = "ticketing"
 version = "0.1.0"
 dependencies = [
  "framework",
+ "kernel",
  "tokio",
 ]
 
