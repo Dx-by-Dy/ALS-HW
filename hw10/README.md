@@ -158,47 +158,239 @@ flowchart LR
 
 ## Пункты задания и где они в коде
 
-| Пункт | Код | Тесты |
-|---|---|---|
-| 1. Создание тикета и проверка клиента в CRM | `ticketing/src/application/intake.rs` (`admit_ticket`), `server/src/commands.rs` | `active_customer_gets_ticket_with_tier_from_crm`, `unknown_or_inactive_customer_is_not_admitted`, `crm_failure_stops_intake`; `server/src/lib.rs`: `crm_decides_who_may_open_tickets` |
-| 1. Проверка ресурсов в ERP | `ticketing/src/application/resource_planning.rs`, `RecordResourceCheck` → `ResourcesChecked` | `available_resources_are_recorded_and_ticket_stays_in_house`, `erp_failure_leaves_ticket_unchecked_and_loop_goes_on`, `resource_check_is_recorded_once`, `resource_check_is_not_activity` |
-| 1. Передача партнёру | `run_resource_planning`, `PartnerRoster`, `HandToPartner` → `HandedToPartner` | `missing_resources_send_ticket_to_partner_of_its_category`, `without_partner_for_category_ticket_stays_in_house`, `partner_is_needed_only_when_resources_are_unavailable`, `ticket_is_handed_to_one_partner_only`; `ticket_without_parts_goes_to_partner_and_with_parts_stays` |
-| 1. Уведомление клиента через CRM | `ticketing/src/application/customer_notices.rs` | `customer_learns_when_ticket_is_received_and_when_it_is_due`, `customer_learns_how_ticket_was_closed_and_whether_sla_was_met`, `internal_steps_are_not_told_to_customer`, `failed_notice_is_reported_and_others_go_on`; `customer_hears_about_ticket_through_crm` |
-| 2. ACL: отдельные адаптеры, логика API внутри них | `integration/src/{crm,erp}.rs`, порты `ticketing/src/application/ports.rs` | `directory_finds_customer_or_reports_unknown`, `outage_is_unavailable_and_bad_data_is_rejected`, `notices_reach_crm_case_history`, `request_is_built_in_erp_terms`, `category_without_materials_does_not_ask_erp`, `adapter_works_with_in_memory_erp` |
-| 2. Тесты преобразования данных | там же | CRM: `identifiers_are_translated_to_crm_numbers`, `account_becomes_customer_profile`, `service_level_codes_map_to_tiers`, `unknown_codes_are_rejected_not_guessed`, `suspended_and_closed_accounts_are_inactive`, `blank_email_means_no_email_and_blank_name_is_rejected`, `new_account_round_trips_to_the_same_profile`, `received_and_reopened_notices_carry_the_deadline_in_millis`, `closing_notice_names_how_and_whether_sla_was_met`, `huge_timestamp_does_not_overflow_millis`, `crm_refusal_is_reported_in_ticket_terms`; ERP: `categories_map_to_material_groups`, `free_stock_decides_availability`, `erp_faults_are_reported_in_ticket_terms` |
-| 3. Open-Host Service: REST API для партнёров | `partner_api/src/lib.rs`, `server/src/partner.rs` | `paths_are_versioned`, `ticket_has_the_published_shape`, `update_comment_may_be_omitted`, `error_carries_machine_code`; `server/src/lib.rs`: `partner_sees_only_tickets_handed_to_it`, `partner_api_requires_a_known_token`, `partner_reports_progress_and_resolves_ticket`, `other_partner_cannot_report_on_foreign_ticket` |
-| 3. Данные об обработке от партнёра | `ReportPartnerProgress`, `ResolveByPartner` в `ticketing/src/domain/ticket/mod.rs` | `partner_progress_is_activity_and_restarts_reminders`, `only_the_assigned_partner_reports_and_with_some_text`, `partner_resolution_closes_ticket_as_resolved`, `partner_cannot_resolve_foreign_or_closed_ticket`, `partner_path_runs_through_the_service` |
-| 4. Shared Kernel: общие сущности и value objects | `kernel/src/{status,sla,time}.rs`; используют `ticketing` и `external::crm` | — |
-| 4. Валидация статусов | `TicketStatus::{can_become, transition_to}`; `Ticket::ensure_can_become`; `InMemoryCrm::log_case_activity` | `allowed_transitions_are_exactly_the_lifecycle_ones`, `allowed_transition_returns_new_status`, `forbidden_transition_names_both_statuses`, `closed_ticket_cannot_be_closed_again_and_open_cannot_be_reopened`, `only_closed_ticket_is_not_open`; в CRM: `case_follows_shared_status_rules`, `case_starts_with_new_and_does_not_close_twice` |
-| 4. Расчёт SLA | `CustomerTier::resolution_secs`, `Sla::{for_tier, due_at, is_overdue, remaining_secs}`; `TicketCreated.sla`, `TicketClosed.sla_met` | `higher_tier_gets_shorter_resolution_time`, `deadline_is_start_plus_resolution_time`, `sla_is_overdue_only_after_deadline`, `remaining_time_counts_down_to_zero`, `deadline_near_end_of_time_does_not_overflow`; в агрегате: `sla_comes_from_customer_tier`, `closing_reports_whether_sla_was_met`, `reopening_starts_new_sla_for_the_same_tier` |
+Тесты указаны как `файл::имя_теста`. Интеграционные выделены отдельно: они проверяют
+несколько настоящих компонентов вместе — подробнее в разделе [«Тесты»](#тесты).
 
-Сверх задания:
+### Часть 1. Бизнес-процесс
 
-| Что | Код | Тесты |
-|---|---|---|
-| Отчёт партнёра — активность: сдвигает напоминания и автозакрытие | `TicketLifecycleSaga::on_event`, `query/src/state.rs` | `partner_progress_moves_all_deadlines`, `resource_check_and_handover_do_not_move_deadlines`, `partner_progress_is_activity_and_moves_auto_close` |
-| Read-your-writes в OHS: ответ на отчёт уже виден в `GET` | `server/src/partner.rs` (`post_update`) | `partner_reports_progress_and_resolves_ticket` |
-| Портал партнёра в клиенте — работает только через OHS | `client/src/model/partner_portal.rs`, `client/src/partner_view_model.rs` | `tickets_are_asked_with_partner_token`, `update_posts_published_request`, `sign_in_shows_partner_tickets_and_selects_first`, `refresh_keeps_selection_and_signs_out_when_token_is_revoked` и др. |
-| SLA, ресурсы и партнёр в read-модели и на карточке тикета | `query/src/{views,state}.rs`, `client/src/view.rs` | `partner_sees_only_tickets_handed_to_it` (read-модель), `partner_updates_and_sla_outcome_are_kept_after_closing`, `reopened_ticket_leaves_partner_and_starts_over` |
+**Создание тикета и проверка клиента в CRM** — `ticketing/src/application/intake.rs` (`admit_ticket`),
+`server/src/commands.rs` (`create_ticket`).
+
+- Модульные:
+  - `ticketing/src/application/intake.rs::active_customer_gets_ticket_with_tier_from_crm`
+  - `ticketing/src/application/intake.rs::unknown_or_inactive_customer_is_not_admitted`
+  - `ticketing/src/application/intake.rs::crm_failure_stops_intake`
+- Интеграционные:
+  - `server/src/lib.rs::crm_decides_who_may_open_tickets`
+
+**Проверка ресурсов в ERP** — `ticketing/src/application/resource_planning.rs`, команда
+`RecordResourceCheck` → событие `ResourcesChecked` в `ticketing/src/domain/ticket/mod.rs`.
+
+- Модульные:
+  - `ticketing/src/application/resource_planning.rs::available_resources_are_recorded_and_ticket_stays_in_house`
+  - `ticketing/src/application/resource_planning.rs::erp_failure_leaves_ticket_unchecked_and_loop_goes_on`
+  - `ticketing/src/application/resource_planning.rs::reopened_ticket_is_planned_again`
+  - `ticketing/src/domain/ticket/mod.rs::resource_check_is_recorded_once`
+  - `ticketing/src/domain/ticket/mod.rs::resource_check_is_not_activity`
+- Интеграционные:
+  - `server/src/lib.rs::ticket_without_parts_goes_to_partner_and_with_parts_stays`
+
+**Передача тикета партнёру** — `run_resource_planning`, `ticketing/src/application/partners.rs`
+(`PartnerRoster`), команда `HandToPartner` → событие `HandedToPartner`.
+
+- Модульные:
+  - `ticketing/src/application/resource_planning.rs::missing_resources_send_ticket_to_partner_of_its_category`
+  - `ticketing/src/application/resource_planning.rs::without_partner_for_category_ticket_stays_in_house`
+  - `ticketing/src/application/resource_planning.rs::rejected_handover_is_reported`
+  - `ticketing/src/application/partners.rs::partner_is_chosen_by_category_ignoring_case`
+  - `ticketing/src/domain/ticket/mod.rs::partner_is_needed_only_when_resources_are_unavailable`
+  - `ticketing/src/domain/ticket/mod.rs::ticket_is_handed_to_one_partner_only`
+- Интеграционные:
+  - `server/src/lib.rs::ticket_without_parts_goes_to_partner_and_with_parts_stays`
+
+**Уведомление клиента через CRM** — `ticketing/src/application/customer_notices.rs`.
+
+- Модульные:
+  - `ticketing/src/application/customer_notices.rs::customer_learns_when_ticket_is_received_and_when_it_is_due`
+  - `ticketing/src/application/customer_notices.rs::customer_learns_how_ticket_was_closed_and_whether_sla_was_met`
+  - `ticketing/src/application/customer_notices.rs::customer_learns_about_reopening_with_new_deadline`
+  - `ticketing/src/application/customer_notices.rs::internal_steps_are_not_told_to_customer`
+  - `ticketing/src/application/customer_notices.rs::failed_notice_is_reported_and_others_go_on`
+- Интеграционные:
+  - `server/src/lib.rs::customer_hears_about_ticket_through_crm`
+
+### Часть 2. Anti-Corruption Layer
+
+**Отдельные адаптеры, логика API внутри них** — порты в `ticketing/src/application/ports.rs`,
+адаптеры в `integration/src/crm.rs` (`CrmAdapter`) и `integration/src/erp.rs` (`ErpAdapter`),
+чужие системы в `external/src/{crm,erp}.rs`.
+
+- Модульные (ERP на заглушке, которая запоминает запросы):
+  - `integration/src/erp.rs::request_is_built_in_erp_terms`
+  - `integration/src/erp.rs::category_without_materials_does_not_ask_erp`
+  - `integration/src/erp.rs::erp_faults_are_reported_in_ticket_terms`
+- Интеграционные (адаптер вместе с in-memory CRM или ERP):
+  - `integration/src/crm.rs::directory_finds_customer_or_reports_unknown`
+  - `integration/src/crm.rs::outage_is_unavailable_and_bad_data_is_rejected`
+  - `integration/src/crm.rs::notices_reach_crm_case_history`
+  - `integration/src/crm.rs::crm_refusal_is_reported_in_ticket_terms`
+  - `integration/src/erp.rs::adapter_works_with_in_memory_erp`
+
+**Тесты преобразования данных** — функции перевода в `integration/src/crm.rs`
+(`account_number`, `tier_from_code`, `to_profile`, `to_case_activity`, …) и
+`integration/src/erp.rs` (`material_group`, `availability`).
+
+- Модульные, CRM:
+  - `integration/src/crm.rs::identifiers_are_translated_to_crm_numbers`
+  - `integration/src/crm.rs::account_becomes_customer_profile`
+  - `integration/src/crm.rs::service_level_codes_map_to_tiers`
+  - `integration/src/crm.rs::unknown_codes_are_rejected_not_guessed`
+  - `integration/src/crm.rs::suspended_and_closed_accounts_are_inactive`
+  - `integration/src/crm.rs::blank_email_means_no_email_and_blank_name_is_rejected`
+  - `integration/src/crm.rs::new_account_round_trips_to_the_same_profile`
+  - `integration/src/crm.rs::received_and_reopened_notices_carry_the_deadline_in_millis`
+  - `integration/src/crm.rs::closing_notice_names_how_and_whether_sla_was_met`
+  - `integration/src/crm.rs::huge_timestamp_does_not_overflow_millis`
+- Модульные, ERP:
+  - `integration/src/erp.rs::categories_map_to_material_groups`
+  - `integration/src/erp.rs::free_stock_decides_availability`
+
+### Часть 3. Open-Host Service
+
+**REST API для партнёров** — опубликованный язык `partner_api/src/lib.rs`, обработчики
+`server/src/partner.rs`, индекс `by_partner` в `query/src/state.rs`.
+
+- Модульные:
+  - `partner_api/src/lib.rs::paths_are_versioned`
+  - `partner_api/src/lib.rs::ticket_has_the_published_shape`
+  - `partner_api/src/lib.rs::update_comment_may_be_omitted`
+  - `partner_api/src/lib.rs::error_carries_machine_code`
+  - `query/src/state.rs::partner_sees_only_tickets_handed_to_it`
+  - `query/src/state.rs::reopened_ticket_leaves_partner_and_starts_over`
+- Интеграционные:
+  - `server/src/lib.rs::partner_sees_only_tickets_handed_to_it`
+  - `server/src/lib.rs::partner_api_requires_a_known_token`
+  - `server/src/lib.rs::other_partner_cannot_report_on_foreign_ticket`
+
+**Данные об обработке от партнёра** — команды `ReportPartnerProgress` и `ResolveByPartner`
+в `ticketing/src/domain/ticket/mod.rs`, `post_update` в `server/src/partner.rs`.
+
+- Модульные:
+  - `ticketing/src/domain/ticket/mod.rs::partner_progress_is_activity_and_restarts_reminders`
+  - `ticketing/src/domain/ticket/mod.rs::only_the_assigned_partner_reports_and_with_some_text`
+  - `ticketing/src/domain/ticket/mod.rs::partner_resolution_closes_ticket_as_resolved`
+  - `ticketing/src/domain/ticket/mod.rs::partner_cannot_resolve_foreign_or_closed_ticket`
+  - `ticketing/src/application/ticket_service.rs::partner_path_runs_through_the_service`
+  - `query/src/state.rs::partner_updates_and_sla_outcome_are_kept_after_closing`
+- Интеграционные:
+  - `server/src/lib.rs::partner_reports_progress_and_resolves_ticket`
+
+### Часть 4. Shared Kernel
+
+**Общие сущности и value objects** — крейт `kernel`: `kernel/src/status.rs`, `kernel/src/sla.rs`,
+`kernel/src/time.rs`. Им пользуются `ticketing` и CRM (`external/src/crm.rs`).
+
+**Валидация статусов** — `TicketStatus::{can_become, transition_to}`; в агрегате —
+`Ticket::ensure_can_become`, в CRM — `InMemoryCrm::log_case_activity`.
+
+- Модульные, ядро:
+  - `kernel/src/status.rs::allowed_transitions_are_exactly_the_lifecycle_ones`
+  - `kernel/src/status.rs::allowed_transition_returns_new_status`
+  - `kernel/src/status.rs::forbidden_transition_names_both_statuses`
+  - `kernel/src/status.rs::closed_ticket_cannot_be_closed_again_and_open_cannot_be_reopened`
+  - `kernel/src/status.rs::only_closed_ticket_is_not_open`
+- Модульные, правила ядра в CRM:
+  - `external/src/crm.rs::case_follows_shared_status_rules`
+  - `external/src/crm.rs::case_starts_with_new_and_does_not_close_twice`
+
+**Расчёт SLA** — `CustomerTier::resolution_secs`, `Sla::{for_tier, due_at, is_overdue, remaining_secs}`;
+в агрегате — `TicketCreated.sla`, `TicketReopened.sla`, `TicketClosed.sla_met`.
+
+- Модульные, ядро:
+  - `kernel/src/sla.rs::higher_tier_gets_shorter_resolution_time`
+  - `kernel/src/sla.rs::deadline_is_start_plus_resolution_time`
+  - `kernel/src/sla.rs::sla_is_overdue_only_after_deadline`
+  - `kernel/src/sla.rs::remaining_time_counts_down_to_zero`
+  - `kernel/src/sla.rs::deadline_near_end_of_time_does_not_overflow`
+- Модульные, агрегат:
+  - `ticketing/src/domain/ticket/mod.rs::sla_comes_from_customer_tier`
+  - `ticketing/src/domain/ticket/mod.rs::closing_reports_whether_sla_was_met`
+  - `ticketing/src/domain/ticket/mod.rs::reopening_starts_new_sla_for_the_same_tier`
+- Интеграционные:
+  - `server/src/lib.rs::customer_hears_about_ticket_through_crm` — SLA уровня Gold нарушено, и CRM получает `sla_met_flag: "N"`
+  - `server/src/lib.rs::partner_reports_progress_and_resolves_ticket` — то же для решения партнёра
+
+### Сверх задания
+
+**Отчёт партнёра — активность: сдвигает напоминания и автозакрытие** —
+`TicketLifecycleSaga::on_event` в `ticketing/src/application/ticket_lifecycle.rs`, `query/src/state.rs`.
+
+- Модульные:
+  - `ticketing/src/application/ticket_lifecycle.rs::partner_progress_moves_all_deadlines`
+  - `ticketing/src/application/ticket_lifecycle.rs::resource_check_and_handover_do_not_move_deadlines`
+  - `query/src/state.rs::partner_progress_is_activity_and_moves_auto_close`
+- Интеграционные:
+  - `server/src/lib.rs::partner_reports_progress_and_resolves_ticket` — срок автозакрытия в `TicketDto` отодвигается
+
+**Read-your-writes в OHS: ответ на отчёт уже виден в `GET`** — `post_update` в `server/src/partner.rs`.
+
+- Интеграционные:
+  - `server/src/lib.rs::partner_reports_progress_and_resolves_ticket`
+
+**Портал партнёра в клиенте, работающий только через OHS** — `client/src/model/partner_portal.rs`,
+`client/src/partner_view_model.rs`.
+
+- Модульные (HTTP на заглушке):
+  - `client/src/model/partner_portal.rs::tickets_are_asked_with_partner_token`
+  - `client/src/model/partner_portal.rs::update_posts_published_request`
+  - `client/src/model/partner_portal.rs::progress_without_comment_is_not_sent`
+  - `client/src/model/partner_portal.rs::partner_error_message_is_shown`
+  - `client/src/partner_view_model.rs::sign_in_shows_partner_tickets_and_selects_first`
+  - `client/src/partner_view_model.rs::rejected_token_does_not_sign_in`
+  - `client/src/partner_view_model.rs::progress_needs_a_comment_and_open_ticket`
+  - `client/src/partner_view_model.rs::report_replaces_ticket_with_answer_and_clears_comment`
+  - `client/src/partner_view_model.rs::failed_resolve_keeps_comment_and_shows_error`
+  - `client/src/partner_view_model.rs::refresh_keeps_selection_and_signs_out_when_token_is_revoked`
 
 Из HW9 остались оркестратор с дедлайнами, хореография, `--time-scale`; из HW8 — командная сторона
-как актор, query side и long polling.
+как актор, query side и long polling. Их тесты перечислены в README соответствующих заданий.
 
 ## Тесты
+
+Всего 370 тестов: 324 модульных и 46 интеграционных.
+
+- **Модульный тест** проверяет один компонент: агрегат, политику, адаптер, ViewModel. Внешние
+  для него части при необходимости заменены заглушками — `Journal` вместо журнала событий,
+  `MockHttpClient` вместо сервера, записывающая ERP вместо настоящей.
+- **Интеграционный тест** проверяет несколько настоящих компонентов, соединённых так же, как
+  в работающем сервере: HTTP-роутер, актор, фоновые циклы, read-модель, адаптеры ACL с
+  in-memory CRM и ERP. Заглушек между ними нет; подменяются только часы.
+
+### Модульные
 
 | Крейт | Тестов | Что проверяют |
 |---|---|---|
 | `kernel` | 13 | переходы статусов, SLA и уровни, время |
 | `external` | 7 | поведение фейковых CRM и ERP, проверка истории обращений по Shared Kernel |
-| `integration` | 20 | перевод моделей CRM и ERP в обе стороны, ошибки внешних систем |
+| `integration` | 15 | перевод моделей CRM и ERP в обе стороны, ERP на записывающей заглушке |
 | `partner_api` | 4 | форма опубликованного языка в JSON |
 | `framework` | 37 | `Lifecycle`, репозиторий и снапшоты, in-memory хранилище, циклы CQRS, очередь дедлайнов, `SagaManager` |
 | `ticketing` | 137 | агрегаты, сервис приложения, сага, политики, часы, приём тикета, планирование ресурсов, сообщения клиенту |
-| `command` | 15 | версии, подписка, отказы, цикл саги на остановленном времени tokio |
-| `query` | 33 + 6 | проекция и запросы; интеграционные — весь конвейер актор → сага и политики → проекция |
-| `server` | 29 + 7 | HTTP API, long polling, сроки в настоящем времени, интеграции и Open-Host Service; разбор аргументов |
+| `command` | 7 | `command/src/actor.rs`: версии, подписка, отказы, параллельные отправители |
+| `query` | 33 | проекция и запросы read-модели |
+| `server` | 2 + 7 | `server/src/lib.rs`: шаг дедлайнов и ожидаемые отказы; `server/src/main.rs`: разбор аргументов |
 | `api` | 1 | текст уведомлений |
 | `client` | 61 | правила команд, формы, `Replica`, `TicketApiService` и портал партнёра на заглушке HTTP, обе ViewModel |
+
+### Интеграционные
+
+| Файл | Тестов | Что соединено | Что проверяют |
+|---|---|---|---|
+| `server/src/lib.rs` | 27 | вся система за HTTP-роутером: актор, сага, политики, read-модель, in-memory CRM и ERP, Open-Host Service | HTTP API и long polling; сроки на `ManualClock` и на ускоренных часах; приём тикета через CRM, передачу партнёру, сообщения клиенту, OHS с токенами |
+| `query/tests/pipeline.rs` | 6 | актор → сага и политики → проекция → запросы | что команды, дедлайны и политики доходят до read-модели и уведомлений |
+| `command/src/lifecycle.rs` | 8 | актор и цикл саги `run_ticket_lifecycle` на остановленном времени tokio | напоминания и автозакрытие в срок, отмена дедлайнов событиями, подхват истории |
+| `integration/src/crm.rs`, `integration/src/erp.rs` | 4 + 1 | адаптеры ACL и in-memory CRM / ERP из `external` | поиск клиента, сбои и непереводимые ответы, запись истории обращений, отказ CRM по правилам Shared Kernel, остатки склада |
+
+Запустить только интеграционные:
+
+```sh
+cargo test -p server --lib
+cargo test -p query --test pipeline
+cargo test -p command lifecycle::
+cargo test -p integration -- directory_finds outage_is notices_reach crm_refusal adapter_works
+```
+
+`cargo test -p server --lib` захватывает и два модульных теста сервера.
 
 Разметку клиента тесты в репозитории не покрывают: её проверял разовый прогон сценария
 «Что посмотреть: интеграции» в headless Chrome, сценарий в репозиторий не входит.
